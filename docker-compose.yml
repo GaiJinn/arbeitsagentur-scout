@@ -1,0 +1,18 @@
+# docker-compose.yml — single-shot container, scheduled by host cron.
+#
+# Run manually:
+#   docker compose run --rm scout
+#
+# Or schedule via host cron (every 4 hours):
+#   0 */4 * * *  cd /opt/arbeitsagentur-scout && /usr/bin/docker compose run --rm scout >> /var/log/scout.log 2>&1
+
+services:
+  scout:
+    build: .
+    image: arbeitsagentur-scout:latest
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./profile.md:/app/profile.md:ro
+      - ./queries.json:/app/queries.json:ro
+    restart: "no"

@@ -1,0 +1,20 @@
+[
+  {
+    "label": "Werkstudent KI/Automation Musterstadt",
+    "params": {
+      "was": "Werkstudent KI Automatisierung",
+      "wo": "Musterstadt",
+      "umkreis": 50,
+      "veroeffentlichtseit": 7
+    }
+  },
+  {
+    "label": "Werkstudent Software Engineering Musterstadt",
+    "params": {
+      "was": "Werkstudent Software",
+      "wo": "Musterstadt",
+      "umkreis": 50,
+      "veroeffentlichtseit": 7
+    }
+  }
+]

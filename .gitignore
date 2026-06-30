@@ -1,0 +1,13 @@
+.env
+profile.md
+queries.json
+.venv/
+__pycache__/
+*.pyc
+*.pyo
+*.db
+data/
+*.log
+.DS_Store
+.idea/
+.vscode/
