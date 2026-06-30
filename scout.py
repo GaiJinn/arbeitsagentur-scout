@@ -71,22 +71,11 @@ log = logging.getLogger("scout")
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
-def main() -> int:
-    log.info("=== arbeitsagentur-scout run start ===")
-    storage = JobStorage(DB_PATH)
-    client = ArbeitsagenturClient()
-    analyzer = LLMAnalyzer(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
-    notifier = (
-        TelegramNotifier(token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID)
-        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
-        else None
-    )
-
-    if analyzer is None:
-        log.warning("GROQ_API_KEY not set — running without LLM analysis.")
-    if notifier is None:
-        log.warning("Telegram credentials missing — output to console only.")
-
+def _collect_new_jobs(
+    client: ArbeitsagenturClient,
+    storage: JobStorage,
+    analyzer: LLMAnalyzer | None,
+) -> list[tuple[Job, JobScore | None]]:
     new_jobs: list[tuple[Job, JobScore | None]] = []
 
     for query in SEARCH_QUERIES:
@@ -118,6 +107,27 @@ def main() -> int:
                     score = None
             storage.save(job, score)
             new_jobs.append((job, score))
+
+    return new_jobs
+
+
+def main() -> int:
+    log.info("=== arbeitsagentur-scout run start ===")
+    storage = JobStorage(DB_PATH)
+    analyzer = LLMAnalyzer(api_key=GROQ_API_KEY) if GROQ_API_KEY else None
+    notifier = (
+        TelegramNotifier(token=TELEGRAM_TOKEN, chat_id=TELEGRAM_CHAT_ID)
+        if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
+        else None
+    )
+
+    if analyzer is None:
+        log.warning("GROQ_API_KEY not set — running without LLM analysis.")
+    if notifier is None:
+        log.warning("Telegram credentials missing — output to console only.")
+
+    with ArbeitsagenturClient() as client:
+        new_jobs = _collect_new_jobs(client, storage, analyzer)
 
     log.info("New jobs total: %d", len(new_jobs))
 

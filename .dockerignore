@@ -1,0 +1,13 @@
+.git
+.env
+profile.md
+queries.json
+data/
+*.db
+*.log
+__pycache__/
+*.pyc
+.venv/
+.DS_Store
+.idea/
+.vscode/

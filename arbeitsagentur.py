@@ -88,12 +88,47 @@ class ArbeitsagenturClient:
         wo: str = "",
         umkreis: int = 0,
         angebotsart: int = 1,
-        page: int = 1,
         size: int = 50,
         veroeffentlichtseit: int | None = None,
         pav: bool = False,
+        max_pages: int = 10,
     ) -> list[Job]:
-        """Run a single search query and return normalized Job objects."""
+        """Run a search query, paging through results, and return all hits.
+
+        Stops once a page comes back short (the last page) or `max_pages`
+        is hit — a safety cap so an overly broad query can't page forever.
+        """
+        jobs: list[Job] = []
+        for page in range(1, max_pages + 1):
+            batch = self._search_page(
+                was=was,
+                wo=wo,
+                umkreis=umkreis,
+                angebotsart=angebotsart,
+                page=page,
+                size=size,
+                veroeffentlichtseit=veroeffentlichtseit,
+                pav=pav,
+            )
+            jobs.extend(batch)
+            if len(batch) < size:
+                break
+        else:
+            log.warning("Hit max_pages=%d for query was=%r wo=%r — results may be truncated.", max_pages, was, wo)
+        return jobs
+
+    def _search_page(
+        self,
+        *,
+        was: str,
+        wo: str,
+        umkreis: int,
+        angebotsart: int,
+        page: int,
+        size: int,
+        veroeffentlichtseit: int | None,
+        pav: bool,
+    ) -> list[Job]:
         params: dict[str, Any] = {
             "was": was,
             "wo": wo,
