@@ -4,6 +4,7 @@
 > ([arbeitsagentur.de](https://www.arbeitsagentur.de/)) — automated search,
 > LLM-based ranking, deduplication, Telegram alerts.
 
+[![CI](https://github.com/GaiJinn/arbeitsagentur-scout/actions/workflows/ci.yml/badge.svg)](https://github.com/GaiJinn/arbeitsagentur-scout/actions/workflows/ci.yml)
 [![Python](https://img.shields.io/badge/Python-3.12-blue)](https://www.python.org/)
 [![Docker](https://img.shields.io/badge/Docker-ready-2496ED)](https://www.docker.com/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
@@ -113,7 +114,18 @@ DB_PATH=./jobs.db python scout.py
 First run will pull a lot of jobs (everything is "new"). Subsequent runs
 only see truly new postings.
 
-### 4. Deploy on a VPS, cron every 4 hours
+### 4. Run the test suite
+
+```bash
+pip install -r requirements-dev.txt
+pytest -v
+```
+
+Tests mock the arbeitsagentur and Groq APIs (no real network calls or API
+keys needed) and cover pagination, retry/backoff, JSON parsing, and SQLite
+dedup. CI runs this on every push via [GitHub Actions](.github/workflows/ci.yml).
+
+### 5. Deploy on a VPS, cron every 4 hours
 
 ```bash
 # on your VPS
@@ -173,7 +185,10 @@ arbeitsagentur-scout/
 ├── analyzer.py         # Groq / Llama scoring against candidate profile
 ├── notifier.py         # Telegram bot output
 ├── storage.py          # SQLite dedup + history
+├── tests/              # pytest suite (mocked APIs, no network needed)
+├── .github/workflows/  # CI — runs the test suite on every push
 ├── requirements.txt
+├── requirements-dev.txt
 ├── Dockerfile
 ├── docker-compose.yml
 ├── .env.example
@@ -189,6 +204,7 @@ arbeitsagentur-scout/
 - [x] Telegram notifications with chunked messages
 - [x] SQLite deduplication + history
 - [x] Docker + cron deployment
+- [x] Test suite + CI
 - [ ] Streamlit UI to browse historical scores
 - [ ] Auto-draft Anschreiben for top-scoring jobs
 - [ ] Multi-portal support (StepStone, Indeed, LinkedIn API)

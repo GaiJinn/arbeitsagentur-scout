@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import base64
 import logging
+import time
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -19,6 +20,8 @@ API_BASE = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4"
 API_KEY = "jobboerse-jobsuche"  # public key used by jobsuche.de itself
 
 DEFAULT_TIMEOUT = httpx.Timeout(30.0, connect=10.0)
+MAX_RETRIES = 3
+RETRY_BACKOFF_SECONDS = 1.0
 
 
 @dataclass
@@ -79,6 +82,37 @@ class ArbeitsagenturClient:
 
     def close(self) -> None:
         self._client.close()
+
+    # -- HTTP with retry -----------------------------------------------------
+    def _get_with_retry(self, url: str, *, params: dict[str, Any] | None = None) -> httpx.Response:
+        """GET with exponential backoff on network errors and 5xx responses.
+
+        4xx responses fail fast — retrying a bad request doesn't help.
+        """
+        last_exc: Exception | None = None
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                r = self._client.get(url, params=params)
+            except httpx.TransportError as exc:
+                last_exc = exc
+            else:
+                if r.status_code < 500:
+                    r.raise_for_status()
+                    return r
+                last_exc = httpx.HTTPStatusError(
+                    f"Server error {r.status_code}", request=r.request, response=r
+                )
+
+            if attempt < MAX_RETRIES:
+                sleep_for = RETRY_BACKOFF_SECONDS * (2 ** (attempt - 1))
+                log.warning(
+                    "GET %s failed (attempt %d/%d): %s — retrying in %.1fs",
+                    url, attempt, MAX_RETRIES, last_exc, sleep_for,
+                )
+                time.sleep(sleep_for)
+
+        assert last_exc is not None
+        raise last_exc
 
     # -- search ------------------------------------------------------------
     def search(
@@ -144,8 +178,7 @@ class ArbeitsagenturClient:
         params = {k: v for k, v in params.items() if v not in ("", None)}
 
         log.debug("GET %s/jobs %s", self.base_url, params)
-        r = self._client.get(f"{self.base_url}/jobs", params=params)
-        r.raise_for_status()
+        r = self._get_with_retry(f"{self.base_url}/jobs", params=params)
         data = r.json()
         return [Job.from_api(item) for item in data.get("stellenangebote", [])]
 
@@ -160,8 +193,7 @@ class ArbeitsagenturClient:
         encoded = base64.b64encode(refnr.encode()).decode()
         url = f"{self.base_url}/jobdetails/{encoded}"
         try:
-            r = self._client.get(url)
-            r.raise_for_status()
+            r = self._get_with_retry(url)
             data = r.json()
         except httpx.HTTPError as exc:
             log.warning("details fetch failed for %s: %s", refnr, exc)
