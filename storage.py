@@ -36,7 +36,18 @@ CREATE TABLE IF NOT EXISTS jobs (
 
 CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
 CREATE INDEX IF NOT EXISTS idx_jobs_seen_at ON jobs(seen_at);
+
+CREATE TABLE IF NOT EXISTS bot_state (
+    key   TEXT PRIMARY KEY,
+    value TEXT NOT NULL
+);
 """
+
+JOB_COLUMNS = (
+    "refnr", "title", "employer", "location", "posted_date", "profession",
+    "url", "description", "score", "summary", "key_skills", "fit_reasons",
+    "flags", "seen_at",
+)
 
 
 class JobStorage:
@@ -49,6 +60,26 @@ class JobStorage:
     def has_job(self, refnr: str) -> bool:
         cur = self.conn.execute("SELECT 1 FROM jobs WHERE refnr = ?", (refnr,))
         return cur.fetchone() is not None
+
+    def get_job(self, refnr: str) -> dict | None:
+        cur = self.conn.execute(
+            f"SELECT {', '.join(JOB_COLUMNS)} FROM jobs WHERE refnr = ?", (refnr,)
+        )
+        row = cur.fetchone()
+        if row is None:
+            return None
+        return dict(zip(JOB_COLUMNS, row))
+
+    def get_bot_state(self, key: str, default: str | None = None) -> str | None:
+        cur = self.conn.execute("SELECT value FROM bot_state WHERE key = ?", (key,))
+        row = cur.fetchone()
+        return row[0] if row else default
+
+    def set_bot_state(self, key: str, value: str) -> None:
+        self.conn.execute(
+            "INSERT OR REPLACE INTO bot_state (key, value) VALUES (?, ?)", (key, value)
+        )
+        self.conn.commit()
 
     def save(self, job: Job, score: JobScore | None) -> None:
         self.conn.execute(

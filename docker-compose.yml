@@ -1,10 +1,11 @@
-# docker-compose.yml — single-shot container, scheduled by host cron.
+# docker-compose.yml — two services sharing one image and one SQLite db:
 #
-# Run manually:
-#   docker compose run --rm scout
+#   scout: single-shot, scheduled by host cron.
+#     docker compose run --rm scout
+#     0 */4 * * *  cd /opt/arbeitsagentur-scout && /usr/bin/docker compose run --rm scout >> /var/log/scout.log 2>&1
 #
-# Or schedule via host cron (every 4 hours):
-#   0 */4 * * *  cd /opt/arbeitsagentur-scout && /usr/bin/docker compose run --rm scout >> /var/log/scout.log 2>&1
+#   bot: long-running, listens for "generate tailored CV" button clicks.
+#     docker compose up -d bot
 
 services:
   scout:
@@ -16,3 +17,13 @@ services:
       - ./profile.md:/app/profile.md:ro
       - ./queries.json:/app/queries.json:ro
     restart: "no"
+
+  bot:
+    build: .
+    image: arbeitsagentur-scout:latest
+    command: python -u telegram_bot.py
+    env_file: .env
+    volumes:
+      - ./data:/data
+      - ./cv.pdf:/app/cv.pdf:ro
+    restart: unless-stopped

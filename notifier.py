@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import html
 import logging
+from typing import Any
 
 import httpx
 
@@ -16,7 +17,7 @@ from arbeitsagentur import Job
 
 log = logging.getLogger("notifier")
 
-TELEGRAM_API = "https://api.telegram.org/bot{token}/sendMessage"
+TELEGRAM_API = "https://api.telegram.org/bot{token}/"
 MAX_MESSAGE_CHARS = 3800  # below the 4096 hard limit, with margin
 
 
@@ -57,22 +58,95 @@ class TelegramNotifier:
     def __init__(self, *, token: str, chat_id: str) -> None:
         self.token = token
         self.chat_id = chat_id
-        self._url = TELEGRAM_API.format(token=token)
+        self._base_url = TELEGRAM_API.format(token=token)
         self._client = httpx.Client(timeout=15.0)
 
-    def _send(self, text: str) -> None:
-        """Send one chunk."""
-        payload = {
+    def close(self) -> None:
+        self._client.close()
+
+    def __enter__(self) -> "TelegramNotifier":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
+
+    # -- low-level Telegram Bot API call ------------------------------------
+    def _call(
+        self,
+        method: str,
+        payload: dict[str, Any],
+        *,
+        files: dict[str, Any] | None = None,
+        timeout: float | None = None,
+    ) -> dict[str, Any] | None:
+        url = self._base_url + method
+        try:
+            if files:
+                r = self._client.post(url, data=payload, files=files, timeout=timeout)
+            else:
+                r = self._client.post(url, json=payload, timeout=timeout)
+            r.raise_for_status()
+            return r.json()
+        except httpx.HTTPError:
+            log.exception("Telegram API call failed: %s", method)
+            return None
+
+    def send_text(self, text: str) -> None:
+        """Send one message to the configured chat."""
+        self._call("sendMessage", {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
+        })
+
+    def send_cv_prompt(self, job: Job, score: JobScore) -> None:
+        """Send a standalone message with a 'generate tailored CV' button."""
+        text = (
+            f"🎯 <b>[{score.score}/10]</b> {_escape(job.title)}\n"
+            f"🏢 {_escape(job.employer)} · 📍 {_escape(job.location)}\n\n"
+            "Lebenslauf für diese Stelle anpassen?"
+        )
+        keyboard = {
+            "inline_keyboard": [[{"text": "📄 CV generieren", "callback_data": f"cv:{job.refnr}"}]]
         }
+        self._call("sendMessage", {
+            "chat_id": self.chat_id,
+            "text": text,
+            "parse_mode": "HTML",
+            "reply_markup": keyboard,
+        })
+
+    def send_document(self, *, file_bytes: bytes, filename: str, caption: str = "") -> bool:
+        files = {"document": (filename, file_bytes, "application/pdf")}
+        payload: dict[str, Any] = {"chat_id": self.chat_id}
+        if caption:
+            payload["caption"] = caption
+        result = self._call("sendDocument", payload, files=files, timeout=30.0)
+        return result is not None
+
+    def answer_callback_query(self, callback_query_id: str, *, text: str = "") -> None:
+        self._call("answerCallbackQuery", {"callback_query_id": callback_query_id, "text": text})
+
+    def remove_inline_keyboard(self, *, chat_id: int | str, message_id: int) -> None:
+        self._call("editMessageReplyMarkup", {
+            "chat_id": chat_id,
+            "message_id": message_id,
+            "reply_markup": {"inline_keyboard": []},
+        })
+
+    def get_updates(self, *, offset: int | None = None, timeout: int = 30) -> list[dict]:
+        """Long-poll for new updates (callback queries, messages, ...)."""
+        params: dict[str, Any] = {"timeout": timeout}
+        if offset is not None:
+            params["offset"] = offset
         try:
-            r = self._client.post(self._url, json=payload)
+            r = self._client.get(self._base_url + "getUpdates", params=params, timeout=timeout + 10)
             r.raise_for_status()
+            return r.json().get("result", [])
         except httpx.HTTPError:
-            log.exception("Telegram send failed.")
+            log.exception("getUpdates failed.")
+            return []
 
     def send_summary(
         self,
@@ -105,4 +179,4 @@ class TelegramNotifier:
             chunks.append(current)
 
         for chunk in chunks:
-            self._send(chunk)
+            self.send_text(chunk)

@@ -24,8 +24,14 @@ Every 4 hours (via cron) the scout:
    summarise the fit in one sentence, and flag concerns.
 4. Pushes a single Telegram message with everything that scored at or above
    your threshold (default 6/10).
+5. For jobs scoring at or above a second, higher threshold (default 7/10),
+   sends a separate message with a "📄 CV generieren" button — tap it and a
+   companion always-on service tailors your base CV to that job and sends
+   the result back as a PDF. See [Auto-generate tailored CVs](#auto-generate-tailored-cvs).
 
-It's a cron-friendly one-shot script — run it, it does its job, exits.
+It's a cron-friendly one-shot script — run it, it does its job, exits. The
+CV-generation button is the one part that needs a small always-on listener
+alongside it (see below).
 
 ## Why I built it
 
@@ -46,20 +52,28 @@ sind aus 30 Minuten "Tab-Hopping" 2 Minuten "Telegram lesen".
                             ▼                    ▼
        ┌─────────────────────────┐    ┌────────────────────┐
        │ arbeitsagentur REST API │    │ Telegram Bot API   │
-       └─────────────────────────┘    └────────────────────┘
-                            │
-                            ▼
-                     ┌─────────────┐
-                     │  SQLite     │
-                     │  (dedup)    │
-                     └─────────────┘
+       └─────────────────────────┘    └─────────┬──────────┘
+                            │                    │ "📄 CV generieren" tap
+                            ▼                    ▼
+                     ┌─────────────┐    ┌──────────────────┐
+                     │  SQLite     │◀───│  telegram_bot.py  │
+                     │  (dedup,    │    │  (long-running,   │
+                     │  job cache) │    │  listens for      │
+                     └─────────────┘    │  button clicks)   │
+                                         └─────────┬──────────┘
+                                                   │
+                                                   ▼
+                                        cv_generator.py: base CV
+                                        (PDF) + job description
+                                        → Groq LLM → tailored PDF
 ```
 
 ## Tech stack
 
 - **Python 3.12** — `httpx` for HTTP, `groq` for LLM, stdlib `sqlite3`
 - **Groq Cloud** with `llama-3.3-70b-versatile` (free tier covers daily use)
-- **Telegram Bot API** for notifications
+- **Telegram Bot API** for notifications and the CV-generation button
+- **pypdf** / **reportlab** to extract and re-render CVs as PDF
 - **Docker** for clean, reproducible deployment
 - **Bundesagentur für Arbeit Jobsuche API** (community-documented at
   [bundesAPI/jobsuche-api](https://github.com/bundesAPI/jobsuche-api))
@@ -87,6 +101,9 @@ You need:
 - `GROQ_API_KEY` → free at [console.groq.com](https://console.groq.com/keys)
 - `TELEGRAM_TOKEN` → ask `@BotFather` on Telegram, `/newbot`
 - `TELEGRAM_CHAT_ID` → see "Get your Telegram chat ID" below
+
+Optional, for tailored-CV generation: drop your base CV at `cv.pdf` (path
+configurable via `BASE_CV_PATH`). See [Auto-generate tailored CVs](#auto-generate-tailored-cvs).
 
 ### 2. Tune your queries
 
@@ -146,6 +163,37 @@ Add:
 0 */4 * * * cd /opt/arbeitsagentur-scout && /usr/bin/docker compose run --rm scout >> /var/log/scout.log 2>&1
 ```
 
+If you want the CV-generation button, also start the always-on listener once:
+
+```bash
+docker compose up -d bot
+```
+
+## Auto-generate tailored CVs
+
+Jobs scoring at or above `CV_SCORE_THRESHOLD` (default 7/10) get a separate
+Telegram message with a "📄 CV generieren" button. Tapping it:
+
+1. Is caught by `telegram_bot.py` — a small **always-on** process, separate
+   from `scout.py`'s one-shot cron runs, long-polling Telegram for button
+   clicks (`docker compose up -d bot`, or `python telegram_bot.py` locally).
+2. Looks the job up in the shared SQLite db (already has the full
+   Stellenbeschreibung from when `scout.py` scored it).
+3. Extracts the text from your base CV (`cv.pdf` / `BASE_CV_PATH`) and asks
+   the LLM to re-emphasise and reorder it for that specific job — it's
+   instructed not to invent skills or experience that aren't in the original.
+4. Renders the result as a new PDF and sends it back via Telegram.
+
+**Important caveat:** the generated PDF is rendered from scratch with a
+plain, simple layout — it is **not** a pixel-perfect copy of your original
+CV's design/fonts/spacing. If your base CV has a carefully crafted layout,
+treat the output as tailored *content* you copy into your own template, not
+a drop-in replacement file.
+
+This feature needs `GROQ_API_KEY` and `BASE_CV_PATH` set; without them
+`telegram_bot.py` refuses to start, and `scout.py` simply skips sending the
+CV-prompt buttons.
+
 ## Get your Telegram chat ID
 
 1. Create a bot: message `@BotFather`, `/newbot`, save the token.
@@ -180,20 +228,23 @@ Power Platform, BWL, Prozessoptimierung
 
 ```
 arbeitsagentur-scout/
-├── scout.py            # Entry point — orchestrates a single run
+├── scout.py            # Entry point — orchestrates a single run (cron)
+├── telegram_bot.py     # Always-on listener for the CV-generation button
 ├── arbeitsagentur.py   # API client (search + jobdetails)
 ├── analyzer.py         # Groq / Llama scoring against candidate profile
-├── notifier.py         # Telegram bot output
-├── storage.py          # SQLite dedup + history
+├── cv_generator.py     # PDF text extraction → LLM tailoring → PDF render
+├── notifier.py         # Telegram bot output (messages, buttons, documents)
+├── storage.py          # SQLite dedup + history + bot poll offset
 ├── tests/              # pytest suite (mocked APIs, no network needed)
 ├── .github/workflows/  # CI — runs the test suite on every push
 ├── requirements.txt
 ├── requirements-dev.txt
 ├── Dockerfile
-├── docker-compose.yml
+├── docker-compose.yml  # scout (one-shot) + bot (long-running) services
 ├── .env.example
 ├── profile.example.md  # copy to profile.md (gitignored) — your real background
 ├── queries.example.json # copy to queries.json (gitignored) — your real searches
+├── cv.pdf               # your base CV (gitignored) — see BASE_CV_PATH
 └── README.md
 ```
 
@@ -205,6 +256,7 @@ arbeitsagentur-scout/
 - [x] SQLite deduplication + history
 - [x] Docker + cron deployment
 - [x] Test suite + CI
+- [x] Auto-generate tailored CVs for high-scoring jobs (Telegram button)
 - [ ] Streamlit UI to browse historical scores
 - [ ] Auto-draft Anschreiben for top-scoring jobs
 - [ ] Multi-portal support (StepStone, Indeed, LinkedIn API)

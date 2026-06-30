@@ -44,6 +44,11 @@ TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 # Minimum LLM score (1-10) for a job to trigger a Telegram alert.
 SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "6"))
 
+# Minimum LLM score for a job to also get a "generate tailored CV" button.
+# Requires BASE_CV_PATH (a PDF) and the telegram_bot.py listener running.
+CV_SCORE_THRESHOLD = int(os.getenv("CV_SCORE_THRESHOLD", "7"))
+BASE_CV_PATH = Path(os.getenv("BASE_CV_PATH") or Path(__file__).parent / "cv.pdf")
+
 # Search queries are loaded from a local file (gitignored) so personal
 # location/role preferences never live in source control. See
 # queries.example.json for the format — copy it to queries.json and tune
@@ -126,40 +131,54 @@ def main() -> int:
     if notifier is None:
         log.warning("Telegram credentials missing — output to console only.")
 
-    with ArbeitsagenturClient() as client:
-        new_jobs = _collect_new_jobs(client, storage, analyzer)
+    try:
+        with ArbeitsagenturClient() as client:
+            new_jobs = _collect_new_jobs(client, storage, analyzer)
 
-    log.info("New jobs total: %d", len(new_jobs))
+        log.info("New jobs total: %d", len(new_jobs))
 
-    if not new_jobs:
-        log.info("Nothing new. Exit clean.")
+        if not new_jobs:
+            log.info("Nothing new. Exit clean.")
+            return 0
+
+        # Filter for Telegram: only score-worthy ones.
+        high_value = [
+            (job, score)
+            for job, score in new_jobs
+            if score is None or score.score >= SCORE_THRESHOLD
+        ]
+        high_value.sort(key=lambda pair: (pair[1].score if pair[1] else 0), reverse=True)
+
+        if notifier and high_value:
+            notifier.send_summary(high_value, total_new=len(new_jobs))
+            log.info("Telegram alert sent: %d high-value jobs.", len(high_value))
+
+            if BASE_CV_PATH.exists():
+                cv_candidates = [
+                    (job, score) for job, score in high_value
+                    if score and score.score >= CV_SCORE_THRESHOLD
+                ]
+                for job, score in cv_candidates:
+                    notifier.send_cv_prompt(job, score)
+                if cv_candidates:
+                    log.info("Sent CV-generation prompts for %d jobs.", len(cv_candidates))
+        elif not high_value:
+            log.info("No jobs above threshold (%d). No alert sent.", SCORE_THRESHOLD)
+        else:
+            # No Telegram → console preview.
+            for job, score in high_value[:10]:
+                score_label = f"[{score.score}/10]" if score else "[--]"
+                print(f"\n{score_label} {job.title}")
+                print(f"  {job.employer} · {job.location}")
+                if score:
+                    print(f"  → {score.summary}")
+                print(f"  {job.url}")
+
+        log.info("=== run end ===")
         return 0
-
-    # Filter for Telegram: only score-worthy ones.
-    high_value = [
-        (job, score)
-        for job, score in new_jobs
-        if score is None or score.score >= SCORE_THRESHOLD
-    ]
-    high_value.sort(key=lambda pair: (pair[1].score if pair[1] else 0), reverse=True)
-
-    if notifier and high_value:
-        notifier.send_summary(high_value, total_new=len(new_jobs))
-        log.info("Telegram alert sent: %d high-value jobs.", len(high_value))
-    elif not high_value:
-        log.info("No jobs above threshold (%d). No alert sent.", SCORE_THRESHOLD)
-    else:
-        # No Telegram → console preview.
-        for job, score in high_value[:10]:
-            score_label = f"[{score.score}/10]" if score else "[--]"
-            print(f"\n{score_label} {job.title}")
-            print(f"  {job.employer} · {job.location}")
-            if score:
-                print(f"  → {score.summary}")
-            print(f"  {job.url}")
-
-    log.info("=== run end ===")
-    return 0
+    finally:
+        if notifier:
+            notifier.close()
 
 
 if __name__ == "__main__":

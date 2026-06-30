@@ -1,6 +1,7 @@
 .env
 profile.md
 queries.json
+cv.pdf
 .venv/
 __pycache__/
 *.pyc

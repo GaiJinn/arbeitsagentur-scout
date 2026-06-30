@@ -78,3 +78,34 @@ def test_db_path_persists_across_instances(tmp_path):
 
     reopened = JobStorage(db_path)
     assert reopened.has_job("ref-persist") is True
+
+
+def test_get_job_returns_none_for_unknown(tmp_path):
+    storage = JobStorage(tmp_path / "jobs.db")
+    assert storage.get_job("unknown") is None
+
+
+def test_get_job_returns_dict_with_score_fields(tmp_path):
+    storage = JobStorage(tmp_path / "jobs.db")
+    job = make_job()
+    score = JobScore(score=9, summary="Top fit", key_skills=["Python"])
+    storage.save(job, score)
+
+    row = storage.get_job(job.refnr)
+    assert row["refnr"] == job.refnr
+    assert row["title"] == job.title
+    assert row["employer"] == job.employer
+    assert row["score"] == 9
+    assert row["summary"] == "Top fit"
+
+
+def test_bot_state_round_trip(tmp_path):
+    storage = JobStorage(tmp_path / "jobs.db")
+    assert storage.get_bot_state("offset") is None
+    assert storage.get_bot_state("offset", default="0") == "0"
+
+    storage.set_bot_state("offset", "42")
+    assert storage.get_bot_state("offset") == "42"
+
+    storage.set_bot_state("offset", "43")
+    assert storage.get_bot_state("offset") == "43"

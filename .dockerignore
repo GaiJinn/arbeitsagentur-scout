@@ -2,6 +2,7 @@
 .env
 profile.md
 queries.json
+cv.pdf
 data/
 *.db
 *.log
