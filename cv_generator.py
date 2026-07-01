@@ -9,23 +9,32 @@ a clean, simply-styled PDF from scratch.
 from __future__ import annotations
 
 import io
-import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
 
 from groq import Groq
 from pypdf import PdfReader
+
+from llm_utils import call_llm_json
+from reportlab.lib.colors import HexColor
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import mm
 from reportlab.platypus import (
+    HRFlowable,
     ListFlowable,
     ListItem,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
 )
+
+# A single restrained accent color, used sparingly (section headings + two
+# hairlines) so the output reads as "clean CV", not "LLM slideshow".
+ACCENT_COLOR = HexColor("#1F4E5F")
+MUTED_COLOR = HexColor("#666666")
+RULE_COLOR = HexColor("#C9D2D6")
 
 log = logging.getLogger("cv_generator")
 
@@ -106,17 +115,16 @@ def tailor_cv(
         location=job_location,
         description=(job_description or "").strip()[:4000],
     )
-    response = client.chat.completions.create(
+    # call_llm_json retries once/twice on malformed JSON and backs off on 429s;
+    # a json.JSONDecodeError here means the model gave up entirely, and is
+    # left to the caller (telegram_bot.py already reports failures to the user).
+    data = call_llm_json(
+        client,
         model=model,
-        messages=[
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": prompt},
-        ],
-        response_format={"type": "json_object"},
+        system_prompt=SYSTEM_PROMPT,
+        user_prompt=prompt,
         temperature=0.3,
     )
-    content = response.choices[0].message.content or "{}"
-    data = json.loads(content)
     return TailoredCV(
         name=data.get("name", ""),
         headline=data.get("headline", ""),
@@ -127,19 +135,48 @@ def tailor_cv(
 
 
 def render_cv_pdf(cv: TailoredCV) -> bytes:
+    """Render a TailoredCV to PDF bytes.
+
+    Deliberately simple, single-column layout (see module docstring — this is
+    not a reproduction of the candidate's original design). The styling below
+    is intentionally restrained: one accent color used only for the name
+    hairline and section headings, generous whitespace, no boxes/backgrounds
+    — the goal is "reads like a competently-typeset CV", not "look at all the
+    ReportLab features".
+    """
     buf = io.BytesIO()
     doc = SimpleDocTemplate(
         buf, pagesize=A4,
         leftMargin=20 * mm, rightMargin=20 * mm,
-        topMargin=18 * mm, bottomMargin=18 * mm,
+        topMargin=18 * mm, bottomMargin=16 * mm,
     )
     styles = getSampleStyleSheet()
-    name_style = ParagraphStyle("CVName", parent=styles["Title"], fontSize=20, spaceAfter=2)
-    headline_style = ParagraphStyle("CVHeadline", parent=styles["Normal"], fontSize=12, textColor="#444444", spaceAfter=4)
-    contact_style = ParagraphStyle("CVContact", parent=styles["Normal"], fontSize=9, textColor="#666666", spaceAfter=10)
-    section_title_style = ParagraphStyle("CVSection", parent=styles["Heading2"], spaceBefore=12, spaceAfter=4)
-    item_heading_style = ParagraphStyle("CVItemHeading", parent=styles["Normal"], fontSize=10.5, leading=14, spaceBefore=4, fontName="Helvetica-Bold")
-    bullet_style = ParagraphStyle("CVBullet", parent=styles["Normal"], fontSize=10, leading=13)
+    name_style = ParagraphStyle(
+        "CVName", parent=styles["Title"], fontSize=21, leading=24,
+        alignment=0, spaceAfter=1,
+    )
+    headline_style = ParagraphStyle(
+        "CVHeadline", parent=styles["Normal"], fontSize=12, leading=15,
+        textColor=ACCENT_COLOR, fontName="Helvetica-Oblique", spaceAfter=3,
+    )
+    contact_style = ParagraphStyle(
+        "CVContact", parent=styles["Normal"], fontSize=9, leading=12,
+        textColor=MUTED_COLOR, spaceAfter=8,
+    )
+    body_style = ParagraphStyle(
+        "CVBody", parent=styles["BodyText"], fontSize=10, leading=14, spaceAfter=6,
+    )
+    section_title_style = ParagraphStyle(
+        "CVSection", parent=styles["Heading2"], fontSize=12.5, leading=15,
+        textColor=ACCENT_COLOR, spaceBefore=14, spaceAfter=2,
+    )
+    item_heading_style = ParagraphStyle(
+        "CVItemHeading", parent=styles["Normal"], fontSize=10.5, leading=14,
+        spaceBefore=6, fontName="Helvetica-Bold",
+    )
+    bullet_style = ParagraphStyle(
+        "CVBullet", parent=styles["Normal"], fontSize=10, leading=13.5,
+    )
 
     story = []
     if cv.name:
@@ -148,14 +185,18 @@ def render_cv_pdf(cv: TailoredCV) -> bytes:
         story.append(Paragraph(cv.headline, headline_style))
     if cv.contact:
         story.append(Paragraph(cv.contact, contact_style))
+    # Hairline under the header block, only drawn if there's a header at all —
+    # an all-empty CV (see tests) shouldn't render a floating rule.
+    if cv.name or cv.headline or cv.contact:
+        story.append(HRFlowable(width="100%", thickness=1, color=ACCENT_COLOR, spaceAfter=8))
     if cv.summary:
-        story.append(Paragraph(cv.summary, styles["BodyText"]))
-        story.append(Spacer(1, 6))
+        story.append(Paragraph(cv.summary, body_style))
 
     for section in cv.sections:
         title = section.get("title", "")
         if title:
             story.append(Paragraph(title, section_title_style))
+            story.append(HRFlowable(width="100%", thickness=0.6, color=RULE_COLOR, spaceAfter=4))
         for item in section.get("items", []):
             heading = item.get("heading", "")
             if heading:
@@ -164,9 +205,10 @@ def render_cv_pdf(cv: TailoredCV) -> bytes:
             if bullets:
                 story.append(
                     ListFlowable(
-                        [ListItem(Paragraph(b, bullet_style)) for b in bullets],
+                        [ListItem(Paragraph(b, bullet_style), spaceAfter=2) for b in bullets],
                         bulletType="bullet",
                         leftIndent=12,
+                        bulletColor=ACCENT_COLOR,
                     )
                 )
 

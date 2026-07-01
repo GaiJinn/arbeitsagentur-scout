@@ -12,6 +12,7 @@ from pathlib import Path
 from groq import Groq
 
 from arbeitsagentur import Job
+from llm_utils import call_llm_json
 
 log = logging.getLogger("analyzer")
 
@@ -88,25 +89,27 @@ class LLMAnalyzer:
             url=job.url,
             description=(job.description or "").strip()[:4000],
         )
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[
-                {"role": "system", "content": SYSTEM_PROMPT},
-                {"role": "user", "content": prompt},
-            ],
-            response_format={"type": "json_object"},
-            temperature=0.2,
-        )
-        content = response.choices[0].message.content or "{}"
         try:
-            data = json.loads(content)
+            data = call_llm_json(
+                self.client,
+                model=self.model,
+                system_prompt=SYSTEM_PROMPT,
+                user_prompt=prompt,
+                temperature=0.2,
+            )
         except json.JSONDecodeError:
-            log.warning("LLM returned non-JSON: %s", content[:200])
+            log.warning("LLM did not return valid JSON after retries for %s", job.refnr)
             return JobScore(score=0, summary="LLM-Parse-Fehler",
                             key_skills=[], fit_reasons=[], flags=["parse_error"])
 
+        # Clamp: a misbehaving model could return an out-of-range or non-numeric score.
+        try:
+            score_value = max(0, min(10, int(data.get("score", 0))))
+        except (TypeError, ValueError):
+            score_value = 0
+
         return JobScore(
-            score=int(data.get("score", 0)),
+            score=score_value,
             summary=data.get("summary", ""),
             key_skills=list(data.get("key_skills", []))[:6],
             fit_reasons=list(data.get("fit_reasons", []))[:4],

@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from job_source import JobSource
+
 log = logging.getLogger("arbeitsagentur")
 
 API_BASE = "https://rest.arbeitsagentur.de/jobboerse/jobsuche-service/pc/v4"
@@ -64,8 +66,10 @@ class Job:
         )
 
 
-class ArbeitsagenturClient:
+class ArbeitsagenturClient(JobSource):
     """Thin wrapper. One method to search, one method to fetch full details."""
+
+    name = "arbeitsagentur"
 
     def __init__(self, *, base_url: str = API_BASE, api_key: str = API_KEY) -> None:
         self.base_url = base_url

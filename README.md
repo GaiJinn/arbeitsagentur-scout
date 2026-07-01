@@ -74,9 +74,27 @@ sind aus 30 Minuten "Tab-Hopping" 2 Minuten "Telegram lesen".
 - **Groq Cloud** with `llama-3.3-70b-versatile` (free tier covers daily use)
 - **Telegram Bot API** for notifications and the CV-generation button
 - **pypdf** / **reportlab** to extract and re-render CVs as PDF
-- **Docker** for clean, reproducible deployment
+- **Docker** for clean, reproducible deployment, with a heartbeat-based
+  `HEALTHCHECK` on the always-on `bot` service
+- **Streamlit** (optional) for a read-only dashboard over the job history
 - **Bundesagentur für Arbeit Jobsuche API** (community-documented at
-  [bundesAPI/jobsuche-api](https://github.com/bundesAPI/jobsuche-api))
+  [bundesAPI/jobsuche-api](https://github.com/bundesAPI/jobsuche-api)) via a
+  `JobSource` interface designed to let a second portal plug in later
+
+### Resilience
+
+- All arbeitsagentur HTTP calls retry with exponential backoff on 5xx/network
+  errors; 4xx fails fast (see `arbeitsagentur.py`).
+- All Groq calls (`llm_utils.py`, shared by `analyzer.py` and
+  `cv_generator.py`) retry on 429 rate limits (honoring `Retry-After` when
+  sent) and re-prompt the model up to twice if it returns malformed JSON.
+- If the full Stellenbeschreibung can't be fetched for a job, that job is
+  saved **unscored** rather than scored on just its title — a thin fallback
+  produces an unreliable LLM score, so scout.py skips scoring instead of
+  guessing.
+- Every log line is tagged with a short id: a `run_id` per `scout.py` cron
+  run, a `request_id` per `telegram_bot.py` callback handled — useful for
+  grepping one run's/request's output out of a shared log file.
 
 ## Quick start
 
@@ -117,6 +135,11 @@ API params:
 | `umkreis`            | radius in km (0/10/25/50/100/200)                       |
 | `veroeffentlichtseit`| only postings of the last N days                        |
 
+Each entry also accepts an optional top-level `"source"` field (default:
+`"arbeitsagentur"`) naming which `JobSource` to run that query against — see
+[Adding a new job source](#adding-a-new-job-source). Today arbeitsagentur is
+the only one implemented, so you can leave it out.
+
 You can also edit `profile.md` to match your own background — that's what
 the LLM scores against.
 
@@ -139,8 +162,11 @@ pytest -v
 ```
 
 Tests mock the arbeitsagentur and Groq APIs (no real network calls or API
-keys needed) and cover pagination, retry/backoff, JSON parsing, and SQLite
-dedup. CI runs this on every push via [GitHub Actions](.github/workflows/ci.yml).
+keys needed) and cover pagination, retry/backoff, JSON parsing, SQLite
+dedup, and the dashboard's filtering logic. `tests/test_integration.py` drives
+`scout.main()` end-to-end over mocked HTTP (search → score → dedup →
+Telegram alert) to catch wiring mistakes the per-module unit tests can't. CI
+runs the whole suite on every push via [GitHub Actions](.github/workflows/ci.yml).
 
 ### 5. Deploy on a VPS, cron every 4 hours
 
@@ -168,6 +194,48 @@ If you want the CV-generation button, also start the always-on listener once:
 ```bash
 docker compose up -d bot
 ```
+
+`docker compose ps` will show `bot` as `healthy`/`unhealthy` based on a
+heartbeat file it writes once per poll cycle (~30s) — useful for noticing a
+silently-hung long-poll loop that `restart: unless-stopped` alone wouldn't
+catch (the process isn't crashed, just stuck).
+
+## Browse job history (dashboard)
+
+A read-only Streamlit page over the same `jobs.db` scout.py writes to —
+filter by score/employer/location, see the LLM's summary/flags/skills per
+job, open the original listing. Never writes to the db, safe to run
+alongside a live cron job / bot.
+
+```bash
+pip install -r requirements-dashboard.txt
+streamlit run dashboard.py
+# or, to point at a specific db:
+DB_PATH=./data/jobs.db streamlit run dashboard.py
+```
+
+Kept as a separate `requirements-dashboard.txt` (Streamlit + pandas) so the
+cron/bot production footprint doesn't grow just to get a browsing UI.
+
+## Adding a new job source
+
+`scout.py`'s pipeline is written against the `JobSource` interface
+(`job_source.py`) rather than against `ArbeitsagenturClient` directly.
+`ArbeitsagenturClient` is the only implementation today, but a second portal
+(StepStone, Indeed, LinkedIn's API, ...) is meant to be:
+
+1. Write a class implementing `JobSource.search(**params)` and
+   `JobSource.fetch_details(refnr)` (both must return normalised `Job`
+   objects / plain text — never raise on a single failed request, since
+   `fetch_details` failures are expected to degrade to "skip scoring", not
+   crash the run).
+2. Register it in `scout.py`'s `SOURCE_REGISTRY` under a short name.
+3. Add `"source": "your-name"` to the relevant `queries.json` entries.
+
+`scout.py` only spins up the sources actually referenced by your
+`queries.json` (via a `contextlib.ExitStack`), so adding a second portal to
+the registry doesn't require credentials for it until you actually add
+queries for it.
 
 ## Auto-generate tailored CVs
 
@@ -230,17 +298,22 @@ Power Platform, BWL, Prozessoptimierung
 arbeitsagentur-scout/
 ├── scout.py            # Entry point — orchestrates a single run (cron)
 ├── telegram_bot.py     # Always-on listener for the CV-generation button
-├── arbeitsagentur.py   # API client (search + jobdetails)
+├── arbeitsagentur.py   # API client (search + jobdetails), implements JobSource
+├── job_source.py       # JobSource interface — the seam for multi-portal support
 ├── analyzer.py         # Groq / Llama scoring against candidate profile
 ├── cv_generator.py     # PDF text extraction → LLM tailoring → PDF render
+├── llm_utils.py         # Shared Groq JSON-retry + rate-limit backoff
 ├── notifier.py         # Telegram bot output (messages, buttons, documents)
 ├── storage.py          # SQLite dedup + history + bot poll offset
+├── dashboard.py         # Optional read-only Streamlit UI over jobs.db
 ├── tests/              # pytest suite (mocked APIs, no network needed)
+│   └── test_integration.py  # end-to-end scout.main() run, all HTTP mocked
 ├── .github/workflows/  # CI — runs the test suite on every push
 ├── requirements.txt
 ├── requirements-dev.txt
+├── requirements-dashboard.txt  # only needed for `streamlit run dashboard.py`
 ├── Dockerfile
-├── docker-compose.yml  # scout (one-shot) + bot (long-running) services
+├── docker-compose.yml  # scout (one-shot) + bot (long-running, healthchecked)
 ├── .env.example
 ├── profile.example.md  # copy to profile.md (gitignored) — your real background
 ├── queries.example.json # copy to queries.json (gitignored) — your real searches
@@ -257,9 +330,12 @@ arbeitsagentur-scout/
 - [x] Docker + cron deployment
 - [x] Test suite + CI
 - [x] Auto-generate tailored CVs for high-scoring jobs (Telegram button)
-- [ ] Streamlit UI to browse historical scores
+- [x] Streamlit UI to browse historical scores
+- [x] Retry/backoff on Groq rate limits and malformed JSON
+- [x] `JobSource` abstraction scaffolded for multi-portal support (only
+      arbeitsagentur implemented so far — see [Adding a new job source](#adding-a-new-job-source))
 - [ ] Auto-draft Anschreiben for top-scoring jobs
-- [ ] Multi-portal support (StepStone, Indeed, LinkedIn API)
+- [ ] Actual StepStone/Indeed/LinkedIn `JobSource` implementations
 
 ## Notes
 

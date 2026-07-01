@@ -12,9 +12,12 @@ Usage:
 """
 from __future__ import annotations
 
+import contextvars
 import logging
 import os
 import sys
+import time
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -41,14 +44,40 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 BASE_CV_PATH = Path(os.getenv("BASE_CV_PATH") or Path(__file__).parent / "cv.pdf")
 
+# Touched once per poll cycle (~every 30s, see run()). Docker's HEALTHCHECK
+# (see docker-compose.yml) considers the process dead if this file hasn't
+# been updated recently — this is a long-polling loop with no HTTP endpoint
+# of its own, so a heartbeat file is the simplest way to notice it silently
+# hung or crashed inside a container.
+HEARTBEAT_PATH = Path(os.getenv("HEARTBEAT_PATH") or "/tmp/telegram_bot_heartbeat")
+
 OFFSET_KEY = "telegram_update_offset"
 CALLBACK_PREFIX = "cv:"
 
+# This process is long-running (not a one-shot cron run like scout.py), so a
+# single "run id" per process wouldn't help trace anything — instead, each
+# handled callback_query (one button tap = one CV generation request) gets
+# its own short request id, threaded through logs via a contextvar so nested
+# calls (cv_generator, notifier, ...) pick it up without needing it passed
+# down explicitly.
+_request_id_var: contextvars.ContextVar[str] = contextvars.ContextVar(
+    "request_id", default="-"
+)
+
+
+class _RequestIdFilter(logging.Filter):
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.request_id = _request_id_var.get()
+        return True
+
+
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] [req=%(request_id)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RequestIdFilter())
 log = logging.getLogger("telegram_bot")
 
 
@@ -109,6 +138,16 @@ def handle_callback_query(
     log.info("Sent tailored CV for refnr=%s", refnr)
 
 
+def _touch_heartbeat() -> None:
+    """Record that the poll loop is still alive. Best-effort: a failure to
+    write the heartbeat shouldn't take the bot down, just fail the container
+    healthcheck (which is the point — someone should notice)."""
+    try:
+        HEARTBEAT_PATH.write_text(str(int(time.time())))
+    except OSError:
+        log.warning("Could not write heartbeat file %s", HEARTBEAT_PATH)
+
+
 def run() -> int:
     if not (TELEGRAM_TOKEN and TELEGRAM_CHAT_ID):
         sys.exit("TELEGRAM_TOKEN / TELEGRAM_CHAT_ID required to run telegram_bot.py.")
@@ -122,15 +161,18 @@ def run() -> int:
     offset = int(offset_str) + 1 if offset_str else None
 
     log.info("telegram_bot listening (base_cv=%s)...", BASE_CV_PATH)
+    _touch_heartbeat()
     try:
         while True:
             updates = notifier.get_updates(offset=offset, timeout=30)
+            _touch_heartbeat()
             for update in updates:
                 offset = update["update_id"] + 1
                 storage.set_bot_state(OFFSET_KEY, str(offset))
                 cq = update.get("callback_query")
                 if not cq:
                     continue
+                token = _request_id_var.set(uuid.uuid4().hex[:8])
                 try:
                     handle_callback_query(
                         cq,
@@ -141,6 +183,8 @@ def run() -> int:
                     )
                 except Exception:
                     log.exception("Error handling callback_query: %s", cq.get("id"))
+                finally:
+                    _request_id_var.reset(token)
     except KeyboardInterrupt:
         log.info("Stopped.")
     finally:

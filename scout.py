@@ -9,16 +9,19 @@ Usage:
 """
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import os
 import sys
+import uuid
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from arbeitsagentur import ArbeitsagenturClient, Job
 from analyzer import LLMAnalyzer, JobScore
+from job_source import JobSource
 from notifier import TelegramNotifier
 from storage import JobStorage
 
@@ -63,21 +66,57 @@ if not QUERIES_PATH.exists():
 SEARCH_QUERIES: list[dict] = json.loads(QUERIES_PATH.read_text(encoding="utf-8"))
 
 # ---------------------------------------------------------------------------
+# Job sources
+# ---------------------------------------------------------------------------
+# Maps a queries.json "source" field to the JobSource implementation to use.
+# arbeitsagentur.de is the only one today; adding a new portal (StepStone,
+# Indeed, ...) is meant to be "write a JobSource subclass, register it here" —
+# see job_source.py — without touching the pipeline below. Queries without an
+# explicit "source" default to arbeitsagentur (backwards-compatible with
+# existing queries.json files).
+DEFAULT_SOURCE = "arbeitsagentur"
+SOURCE_REGISTRY: dict[str, type[JobSource]] = {
+    DEFAULT_SOURCE: ArbeitsagenturClient,
+}
+
+# ---------------------------------------------------------------------------
 # Logging
 # ---------------------------------------------------------------------------
+# A short id per cron run, attached to every log line, so grepping one run's
+# worth of output out of a shared log file (or journald) is a single `grep
+# run=xxxxxxxx` instead of guessing timestamps.
+RUN_ID = uuid.uuid4().hex[:8]
+
+
+class _RunIdFilter(logging.Filter):
+    def __init__(self, run_id: str) -> None:
+        super().__init__()
+        self.run_id = run_id
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        record.run_id = self.run_id
+        return True
+
+
 logging.basicConfig(
     level=LOG_LEVEL,
-    format="%(asctime)s [%(levelname)s] %(name)s: %(message)s",
+    format="%(asctime)s [%(levelname)s] [run=%(run_id)s] %(name)s: %(message)s",
     datefmt="%Y-%m-%d %H:%M:%S",
 )
+# Attached to the handler (not the root logger) so it applies to records
+# propagated up from every module's logger (analyzer, arbeitsagentur, ...),
+# not just ones logged directly through the root logger.
+for _handler in logging.getLogger().handlers:
+    _handler.addFilter(_RunIdFilter(RUN_ID))
 log = logging.getLogger("scout")
+log.info("run id: %s", RUN_ID)
 
 
 # ---------------------------------------------------------------------------
 # Pipeline
 # ---------------------------------------------------------------------------
 def _collect_new_jobs(
-    client: ArbeitsagenturClient,
+    sources: dict[str, JobSource],
     storage: JobStorage,
     analyzer: LLMAnalyzer | None,
 ) -> list[tuple[Job, JobScore | None]]:
@@ -86,7 +125,16 @@ def _collect_new_jobs(
     for query in SEARCH_QUERIES:
         label = query["label"]
         params = query["params"]
-        log.info("Searching: %s", label)
+        source_name = query.get("source", DEFAULT_SOURCE)
+        client = sources.get(source_name)
+        if client is None:
+            log.error(
+                "Query %r asks for source %r, but only %s is configured — skipping.",
+                label, source_name, sorted(sources) or "(none)",
+            )
+            continue
+
+        log.info("Searching [%s]: %s", source_name, label)
         try:
             results = client.search(**params)
         except Exception:  # noqa: BLE001
@@ -99,17 +147,31 @@ def _collect_new_jobs(
                 continue
             score: JobScore | None = None
             if analyzer:
-                # Pull full description for richer scoring.
+                # Pull the full Stellenbeschreibung for richer scoring. If it
+                # fails, do NOT fall back to scoring off just "beruf — titel"
+                # (a couple of words) — that starves the LLM of context and
+                # produces an unreliable score. Skip scoring for this job
+                # instead; it stays unscored ([--]  in the summary) rather
+                # than silently mis-ranked.
+                detail_text = ""
                 try:
                     detail_text = client.fetch_details(job.refnr)
-                    job.description = detail_text or job.description
                 except Exception:  # noqa: BLE001
-                    log.warning("details fetch failed for %s", job.refnr)
-                try:
-                    score = analyzer.score(job)
-                except Exception:  # noqa: BLE001
-                    log.exception("LLM scoring failed for %s", job.refnr)
-                    score = None
+                    log.warning("details fetch raised for %s", job.refnr)
+
+                if detail_text:
+                    job.description = detail_text
+                    try:
+                        score = analyzer.score(job)
+                    except Exception:  # noqa: BLE001
+                        log.exception("LLM scoring failed for %s", job.refnr)
+                        score = None
+                else:
+                    log.warning(
+                        "No Stellenbeschreibung available for %s (%s) — "
+                        "skipping LLM scoring rather than scoring on title alone.",
+                        job.refnr, job.title,
+                    )
             storage.save(job, score)
             new_jobs.append((job, score))
 
@@ -131,9 +193,25 @@ def main() -> int:
     if notifier is None:
         log.warning("Telegram credentials missing — output to console only.")
 
+    # Only spin up the sources actually referenced by queries.json (usually
+    # just "arbeitsagentur"), so adding a second portal later doesn't require
+    # credentials/config for portals you haven't configured any queries for.
+    active_source_names = {q.get("source", DEFAULT_SOURCE) for q in SEARCH_QUERIES}
+    unknown = active_source_names - SOURCE_REGISTRY.keys()
+    if unknown:
+        log.error(
+            "queries.json references unknown source(s) %s — configured: %s",
+            sorted(unknown), sorted(SOURCE_REGISTRY),
+        )
+
     try:
-        with ArbeitsagenturClient() as client:
-            new_jobs = _collect_new_jobs(client, storage, analyzer)
+        with contextlib.ExitStack() as stack:
+            sources: dict[str, JobSource] = {
+                name: stack.enter_context(cls())
+                for name, cls in SOURCE_REGISTRY.items()
+                if name in active_source_names
+            }
+            new_jobs = _collect_new_jobs(sources, storage, analyzer)
 
         log.info("New jobs total: %d", len(new_jobs))
 

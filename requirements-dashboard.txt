@@ -1,0 +1,5 @@
+# Optional — only needed for `streamlit run dashboard.py`.
+# Kept separate from requirements.txt so scout.py / telegram_bot.py's
+# production/cron dependency footprint doesn't grow just to browse history.
+streamlit>=1.35,<2.0
+pandas>=2.0,<3.0

@@ -137,3 +137,24 @@ def test_handle_callback_query_generation_failure_sends_warning(tmp_path, monkey
 
     notifier.send_text.assert_called_once()
     notifier.send_document.assert_not_called()
+
+
+# -- heartbeat (used by docker-compose's HEALTHCHECK) --------------------------
+
+def test_touch_heartbeat_writes_a_recent_timestamp(tmp_path, monkeypatch):
+    import time
+
+    heartbeat_path = tmp_path / "heartbeat"
+    monkeypatch.setattr(telegram_bot, "HEARTBEAT_PATH", heartbeat_path)
+
+    telegram_bot._touch_heartbeat()
+
+    assert heartbeat_path.exists()
+    assert abs(int(heartbeat_path.read_text()) - int(time.time())) < 5
+
+
+def test_touch_heartbeat_does_not_raise_if_path_unwritable(monkeypatch):
+    from pathlib import Path
+
+    monkeypatch.setattr(telegram_bot, "HEARTBEAT_PATH", Path("/no/such/dir/heartbeat"))
+    telegram_bot._touch_heartbeat()  # must not raise
