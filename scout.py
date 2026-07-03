@@ -124,6 +124,11 @@ logging.basicConfig(
 # not just ones logged directly through the root logger.
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(_RunIdFilter(RUN_ID))
+# httpx logs every request at INFO — and the Telegram bot token is in the
+# sendMessage/getUpdates URL path, so that would write the token in plaintext
+# into the log file on every call. Quiet httpx to WARNING so secrets don't
+# leak into logs (scout already logs its own per-query search lines).
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("scout")
 log.info("run id: %s", RUN_ID)
 

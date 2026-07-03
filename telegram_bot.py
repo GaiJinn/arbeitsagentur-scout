@@ -78,6 +78,10 @@ logging.basicConfig(
 )
 for _handler in logging.getLogger().handlers:
     _handler.addFilter(_RequestIdFilter())
+# httpx logs every request at INFO — and this bot long-polls getUpdates every
+# ~30s with the Telegram token in the URL path, so at INFO it would write the
+# token in plaintext to the log on every poll. Quiet httpx to WARNING.
+logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("telegram_bot")
 
 
