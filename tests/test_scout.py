@@ -179,6 +179,75 @@ def test_search_failure_for_one_query_does_not_abort_others(monkeypatch):
     assert new_jobs[0][0].refnr == "job-2"
 
 
+class FakeBotStorage(FakeStorage):
+    """FakeStorage plus the bot_state key/value store the heartbeat needs."""
+
+    def __init__(self):
+        super().__init__()
+        self.state: dict[str, str] = {}
+
+    def get_bot_state(self, key, default=None):
+        return self.state.get(key, default)
+
+    def set_bot_state(self, key, value):
+        self.state[key] = value
+
+
+class RecordingNotifier:
+    def __init__(self, ok=True):
+        self.ok = ok
+        self.texts: list[str] = []
+
+    def send_text(self, text):
+        self.texts.append(text)
+        return self.ok
+
+
+def test_heartbeat_no_extra_ping_when_alert_sent():
+    storage = FakeBotStorage()
+    notifier = RecordingNotifier()
+    scout._handle_heartbeat(notifier, storage, alert_sent=True, quiet=False, total_new=3)
+    assert notifier.texts == []  # the alert itself proves liveness
+    assert scout.HEARTBEAT_STATE_KEY in storage.state  # window still reset
+
+
+def test_heartbeat_pings_on_quiet_run_when_due(monkeypatch):
+    monkeypatch.setattr(scout, "HEARTBEAT_HOURS", 24)
+    storage = FakeBotStorage()  # no prior heartbeat → due immediately
+    notifier = RecordingNotifier()
+    scout._handle_heartbeat(notifier, storage, alert_sent=False, quiet=True, total_new=5)
+    assert len(notifier.texts) == 1
+    assert "läuft" in notifier.texts[0]
+    assert storage.state.get(scout.HEARTBEAT_STATE_KEY)
+
+
+def test_heartbeat_suppressed_when_recent(monkeypatch):
+    monkeypatch.setattr(scout, "HEARTBEAT_HOURS", 24)
+    storage = FakeBotStorage()
+    storage.state[scout.HEARTBEAT_STATE_KEY] = scout._now_iso()  # pinged just now
+    notifier = RecordingNotifier()
+    scout._handle_heartbeat(notifier, storage, alert_sent=False, quiet=True, total_new=0)
+    assert notifier.texts == []
+
+
+def test_heartbeat_not_sent_when_send_failed_so_run_not_quiet(monkeypatch):
+    # high_value existed but the alert send failed (quiet=False): don't paper
+    # over that failure with a falsely-reassuring "all good" ping.
+    monkeypatch.setattr(scout, "HEARTBEAT_HOURS", 24)
+    storage = FakeBotStorage()
+    notifier = RecordingNotifier()
+    scout._handle_heartbeat(notifier, storage, alert_sent=False, quiet=False, total_new=2)
+    assert notifier.texts == []
+
+
+def test_heartbeat_disabled_when_hours_zero(monkeypatch):
+    monkeypatch.setattr(scout, "HEARTBEAT_HOURS", 0)
+    storage = FakeBotStorage()
+    notifier = RecordingNotifier()
+    scout._handle_heartbeat(notifier, storage, alert_sent=False, quiet=True, total_new=1)
+    assert notifier.texts == []
+
+
 def test_query_with_unknown_source_is_skipped_not_fatal(monkeypatch):
     _patch_queries(monkeypatch, [
         {"label": "stepstone query", "params": {}, "source": "stepstone"},

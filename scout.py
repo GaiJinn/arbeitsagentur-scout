@@ -15,12 +15,14 @@ import logging
 import os
 import sys
 import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from dotenv import load_dotenv
 
 from arbeitsagentur import ArbeitsagenturClient, Job
 from analyzer import LLMAnalyzer, JobScore
+from ats_sources import GreenhouseSource, LeverSource, PersonioSource
 from job_source import JobSource
 from notifier import TelegramNotifier
 from storage import JobStorage
@@ -52,6 +54,15 @@ SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "6"))
 CV_SCORE_THRESHOLD = int(os.getenv("CV_SCORE_THRESHOLD", "7"))
 BASE_CV_PATH = Path(os.getenv("BASE_CV_PATH") or Path(__file__).parent / "cv.pdf")
 
+# Dead-man's switch. scout runs on a schedule but stays silent when there's
+# nothing above threshold — which is indistinguishable from a crashed cron,
+# a dead container, or a revoked token. To make "no news" mean "good news"
+# rather than "is it even alive?", send a short heartbeat ping on an
+# otherwise-silent run, but at most once per HEARTBEAT_HOURS so it doesn't
+# become noise. 0 disables it. State (last ping time) lives in the shared db.
+HEARTBEAT_HOURS = int(os.getenv("HEARTBEAT_HOURS", "24"))
+HEARTBEAT_STATE_KEY = "last_heartbeat"
+
 # Search queries are loaded from a local file (gitignored) so personal
 # location/role preferences never live in source control. See
 # queries.example.json for the format — copy it to queries.json and tune
@@ -77,6 +88,11 @@ SEARCH_QUERIES: list[dict] = json.loads(QUERIES_PATH.read_text(encoding="utf-8")
 DEFAULT_SOURCE = "arbeitsagentur"
 SOURCE_REGISTRY: dict[str, type[JobSource]] = {
     DEFAULT_SOURCE: ArbeitsagenturClient,
+    # Public, no-auth ATS feeds — see ats_sources.py module docstring for why
+    # these three specifically (official public APIs, not scraping).
+    "greenhouse": GreenhouseSource,
+    "lever": LeverSource,
+    "personio": PersonioSource,
 }
 
 # ---------------------------------------------------------------------------
@@ -178,6 +194,53 @@ def _collect_new_jobs(
     return new_jobs
 
 
+def _now_iso() -> str:
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _handle_heartbeat(
+    notifier: TelegramNotifier | None,
+    storage: JobStorage,
+    *,
+    alert_sent: bool,
+    quiet: bool,
+    total_new: int,
+) -> None:
+    """Dead-man's switch.
+
+    A real alert already proves the scout is alive, so an alert-sent run just
+    resets the timer. On a genuinely quiet run (nothing above threshold),
+    send a short "still running" ping — but no more than once per
+    HEARTBEAT_HOURS — so a silent scout is distinguishable from "just no new
+    jobs". `quiet` is False when there *were* high-value jobs but the send
+    failed: we deliberately don't paper that over with an all-good ping.
+    """
+    if alert_sent:
+        storage.set_bot_state(HEARTBEAT_STATE_KEY, _now_iso())
+        return
+    if notifier is None or HEARTBEAT_HOURS <= 0 or not quiet:
+        return
+
+    last = storage.get_bot_state(HEARTBEAT_STATE_KEY)
+    if last:
+        try:
+            last_dt = datetime.fromisoformat(last)
+        except ValueError:
+            last_dt = None
+        if last_dt is not None and (
+            datetime.now(timezone.utc) - last_dt < timedelta(hours=HEARTBEAT_HOURS)
+        ):
+            return
+
+    text = (
+        "✅ <b>scout läuft</b> — keine neuen Treffer über Schwelle "
+        f"{SCORE_THRESHOLD}.\n<i>{total_new} neue Stelle(n) geprüft.</i>"
+    )
+    if notifier.send_text(text):
+        storage.set_bot_state(HEARTBEAT_STATE_KEY, _now_iso())
+        log.info("Heartbeat ping sent (no jobs above threshold).")
+
+
 def main() -> int:
     log.info("=== arbeitsagentur-scout run start ===")
     storage = JobStorage(DB_PATH)
@@ -214,12 +277,10 @@ def main() -> int:
             new_jobs = _collect_new_jobs(sources, storage, analyzer)
 
         log.info("New jobs total: %d", len(new_jobs))
-
         if not new_jobs:
-            log.info("Nothing new. Exit clean.")
-            return 0
+            log.info("Nothing new this run.")
 
-        # Filter for Telegram: only score-worthy ones.
+        # Filter for Telegram: only score-worthy ones (unscored jobs pass too).
         high_value = [
             (job, score)
             for job, score in new_jobs
@@ -227,23 +288,34 @@ def main() -> int:
         ]
         high_value.sort(key=lambda pair: (pair[1].score if pair[1] else 0), reverse=True)
 
+        alert_sent = False
         if notifier and high_value:
-            notifier.send_summary(high_value, total_new=len(new_jobs))
-            log.info("Telegram alert sent: %d high-value jobs.", len(high_value))
+            if notifier.send_summary(high_value, total_new=len(new_jobs)):
+                alert_sent = True
+                log.info("Telegram alert sent: %d high-value jobs.", len(high_value))
 
-            if BASE_CV_PATH.exists():
-                cv_candidates = [
-                    (job, score) for job, score in high_value
-                    if score and score.score >= CV_SCORE_THRESHOLD
-                ]
-                for job, score in cv_candidates:
-                    notifier.send_cv_prompt(job, score)
-                if cv_candidates:
-                    log.info("Sent CV-generation prompts for %d jobs.", len(cv_candidates))
-        elif not high_value:
-            log.info("No jobs above threshold (%d). No alert sent.", SCORE_THRESHOLD)
-        else:
-            # No Telegram → console preview.
+                if BASE_CV_PATH.exists():
+                    cv_candidates = [
+                        (job, score) for job, score in high_value
+                        if score and score.score >= CV_SCORE_THRESHOLD
+                    ]
+                    for job, score in cv_candidates:
+                        notifier.send_cv_prompt(job, score)
+                    if cv_candidates:
+                        log.info("Sent CV-generation prompts for %d jobs.", len(cv_candidates))
+            else:
+                # Previously the send result was ignored and this path still
+                # logged "alert sent" — a Telegram 400 (bad chat_id, malformed
+                # HTML, over-long message) looked green in the logs but never
+                # reached the phone. Now it's a loud error instead of a silent
+                # false success.
+                log.error(
+                    "Telegram send FAILED for %d high-value jobs — check "
+                    "TELEGRAM_TOKEN / TELEGRAM_CHAT_ID and message formatting.",
+                    len(high_value),
+                )
+        elif not notifier and high_value:
+            # No Telegram configured → console preview.
             for job, score in high_value[:10]:
                 score_label = f"[{score.score}/10]" if score else "[--]"
                 print(f"\n{score_label} {job.title}")
@@ -251,6 +323,16 @@ def main() -> int:
                 if score:
                     print(f"  → {score.summary}")
                 print(f"  {job.url}")
+        else:
+            log.info("No jobs above threshold (%d). No alert sent.", SCORE_THRESHOLD)
+
+        # Dead-man's switch: keep silence meaningful (see _handle_heartbeat).
+        _handle_heartbeat(
+            notifier, storage,
+            alert_sent=alert_sent,
+            quiet=not high_value,
+            total_new=len(new_jobs),
+        )
 
         log.info("=== run end ===")
         return 0

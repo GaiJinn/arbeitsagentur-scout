@@ -136,9 +136,10 @@ API params:
 | `veroeffentlichtseit`| only postings of the last N days                        |
 
 Each entry also accepts an optional top-level `"source"` field (default:
-`"arbeitsagentur"`) naming which `JobSource` to run that query against — see
-[Adding a new job source](#adding-a-new-job-source). Today arbeitsagentur is
-the only one implemented, so you can leave it out.
+`"arbeitsagentur"`) naming which `JobSource` to run that query against —
+`"greenhouse"`, `"lever"`, and `"personio"` are also built in, for watching
+specific companies' career pages directly. See
+[Watching specific companies](#watching-specific-companies).
 
 You can also edit `profile.md` to match your own background — that's what
 the LLM scores against.
@@ -217,12 +218,67 @@ DB_PATH=./data/jobs.db streamlit run dashboard.py
 Kept as a separate `requirements-dashboard.txt` (Streamlit + pandas) so the
 cron/bot production footprint doesn't grow just to get a browsing UI.
 
-## Adding a new job source
+## Watching specific companies
+
+Besides arbeitsagentur.de, `scout.py` can watch individual companies'
+career pages directly — but only via their **applicant-tracking system's
+official public feed**, never by scraping arbitrary HTML or hitting
+LinkedIn. LinkedIn has no public API for this and is aggressively
+anti-scraping (ToS-hostile, rate-limited, legal history of going after
+scrapers) — not worth building against. A hand-rolled scraper for one
+company's own custom-built careers page is *possible* (BeautifulSoup/
+Playwright, one adapter per site) but fragile — it breaks on every redesign
+and doesn't fit the stable `JobSource` interface below without a bespoke
+parser per company.
+
+What does fit cleanly: many companies' career pages are actually powered by
+one of a handful of ATS platforms, which publish a public, no-auth,
+official JSON/XML feed meant for exactly this kind of external read.
+`ats_sources.py` implements three:
+
+| source (`"source"` field) | platform | required params | check if a company uses it |
+| --- | --- | --- | --- |
+| `greenhouse` | Greenhouse | `board_token`, optional `employer`, `keywords`, `location` | careers page URL contains `greenhouse.io` or `boards.greenhouse.io/{board_token}` |
+| `lever` | Lever | `site`, optional `employer`, `keywords`, `location`, `team`, `commitment` | careers page URL contains `jobs.lever.co/{site}` |
+| `personio` | Personio | `company`, optional `employer`, `keywords`, `location`, `language` | careers page URL looks like `{company}.jobs.personio.de` — very common for German SMEs/Mittelstand |
+
+`keywords` filters client-side (all words must appear, whole-word match) —
+none of these three APIs support full-text search server-side, so `scout.py`
+fetches every open posting for that board/site/company and filters locally,
+the same shape as arbeitsagentur's `was` just resolved on your end instead
+of theirs.
+
+Example `queries.json` entries:
+
+```json
+{
+  "label": "Musterfirma AG — Werkstudent (Greenhouse)",
+  "source": "greenhouse",
+  "params": { "board_token": "musterfirma", "employer": "Musterfirma AG", "keywords": "Werkstudent" }
+},
+{
+  "label": "Musterfirma GmbH — Werkstudent Berlin (Lever)",
+  "source": "lever",
+  "params": { "site": "musterfirma", "employer": "Musterfirma GmbH", "keywords": "Werkstudent", "location": "Berlin" }
+},
+{
+  "label": "Musterfirma KG — Werkstudent (Personio)",
+  "source": "personio",
+  "params": { "company": "musterfirma", "employer": "Musterfirma KG", "keywords": "Werkstudent" }
+}
+```
+
+(Not included in `queries.example.json` itself, since these placeholder
+tokens don't correspond to real companies and would just log search errors
+every run — swap in real `board_token`/`site`/`company` values for
+companies you're actually targeting.)
+
+### Adding another source type
 
 `scout.py`'s pipeline is written against the `JobSource` interface
-(`job_source.py`) rather than against `ArbeitsagenturClient` directly.
-`ArbeitsagenturClient` is the only implementation today, but a second portal
-(StepStone, Indeed, LinkedIn's API, ...) is meant to be:
+(`job_source.py`), not against any one implementation directly. To add a
+fourth (SmartRecruiters, Workable, a hand-rolled scraper for one specific
+company, ...):
 
 1. Write a class implementing `JobSource.search(**params)` and
    `JobSource.fetch_details(refnr)` (both must return normalised `Job`
@@ -233,9 +289,9 @@ cron/bot production footprint doesn't grow just to get a browsing UI.
 3. Add `"source": "your-name"` to the relevant `queries.json` entries.
 
 `scout.py` only spins up the sources actually referenced by your
-`queries.json` (via a `contextlib.ExitStack`), so adding a second portal to
-the registry doesn't require credentials for it until you actually add
-queries for it.
+`queries.json` (via a `contextlib.ExitStack`), so adding a source to the
+registry doesn't require credentials for it until you actually add queries
+for it.
 
 ## Auto-generate tailored CVs
 
@@ -300,6 +356,7 @@ arbeitsagentur-scout/
 ├── telegram_bot.py     # Always-on listener for the CV-generation button
 ├── arbeitsagentur.py   # API client (search + jobdetails), implements JobSource
 ├── job_source.py       # JobSource interface — the seam for multi-portal support
+├── ats_sources.py       # Greenhouse / Lever / Personio JobSource implementations
 ├── analyzer.py         # Groq / Llama scoring against candidate profile
 ├── cv_generator.py     # PDF text extraction → LLM tailoring → PDF render
 ├── llm_utils.py         # Shared Groq JSON-retry + rate-limit backoff
@@ -332,10 +389,16 @@ arbeitsagentur-scout/
 - [x] Auto-generate tailored CVs for high-scoring jobs (Telegram button)
 - [x] Streamlit UI to browse historical scores
 - [x] Retry/backoff on Groq rate limits and malformed JSON
-- [x] `JobSource` abstraction scaffolded for multi-portal support (only
-      arbeitsagentur implemented so far — see [Adding a new job source](#adding-a-new-job-source))
+- [x] `JobSource` abstraction for multi-portal support
+- [x] Watch specific companies' career pages via Greenhouse/Lever/Personio's
+      public feeds (see [Watching specific companies](#watching-specific-companies))
+- [x] Heartbeat / dead-man's switch — a periodic "scout läuft" ping on an
+      otherwise-silent run (`HEARTBEAT_HOURS`, default 24; 0 disables) so no
+      messages means "no new jobs", not "cron/container/token is dead"
 - [ ] Auto-draft Anschreiben for top-scoring jobs
-- [ ] Actual StepStone/Indeed/LinkedIn `JobSource` implementations
+- [ ] SmartRecruiters/Workable `JobSource` implementations
+- [ ] LinkedIn / StepStone / Indeed — intentionally not planned; see
+      [Watching specific companies](#watching-specific-companies) for why
 
 ## Notes
 

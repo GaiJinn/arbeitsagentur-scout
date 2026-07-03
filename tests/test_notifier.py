@@ -37,6 +37,42 @@ def test_send_cv_prompt_includes_callback_data_with_refnr():
 
 
 @respx.mock
+def test_send_text_returns_true_on_success():
+    respx.post(f"{API_BASE}/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {}})
+    )
+    notifier = TelegramNotifier(token=TOKEN, chat_id="123")
+    assert notifier.send_text("hi") is True
+
+
+@respx.mock
+def test_send_text_returns_false_on_error():
+    # A Telegram 400 (e.g. bad chat_id) must surface as False, not a swallowed
+    # success — this is what lets scout.py avoid logging a false "alert sent".
+    respx.post(f"{API_BASE}/sendMessage").mock(return_value=httpx.Response(400))
+    notifier = TelegramNotifier(token=TOKEN, chat_id="123")
+    assert notifier.send_text("hi") is False
+
+
+@respx.mock
+def test_send_summary_returns_true_when_all_chunks_succeed():
+    respx.post(f"{API_BASE}/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {}})
+    )
+    notifier = TelegramNotifier(token=TOKEN, chat_id="123")
+    ok = notifier.send_summary([(make_job(), JobScore(score=8, summary="ok"))], total_new=1)
+    assert ok is True
+
+
+@respx.mock
+def test_send_summary_returns_false_when_send_fails():
+    respx.post(f"{API_BASE}/sendMessage").mock(return_value=httpx.Response(400))
+    notifier = TelegramNotifier(token=TOKEN, chat_id="123")
+    ok = notifier.send_summary([(make_job(), JobScore(score=8, summary="ok"))], total_new=1)
+    assert ok is False
+
+
+@respx.mock
 def test_send_document_posts_multipart():
     route = respx.post(f"{API_BASE}/sendDocument").mock(
         return_value=httpx.Response(200, json={"ok": True, "result": {}})

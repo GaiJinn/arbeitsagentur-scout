@@ -91,16 +91,23 @@ class TelegramNotifier:
             log.exception("Telegram API call failed: %s", method)
             return None
 
-    def send_text(self, text: str) -> None:
-        """Send one message to the configured chat."""
-        self._call("sendMessage", {
+    def send_text(self, text: str) -> bool:
+        """Send one message to the configured chat. Returns True on success.
+
+        A False here — Telegram returned an error (e.g. 400 on a bad chat_id
+        or malformed HTML), which `_call` logs and swallows into a None — is
+        how callers avoid recording a falsely-successful "alert sent" for a
+        message that never reached the phone. See scout.py.
+        """
+        result = self._call("sendMessage", {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
             "disable_web_page_preview": True,
         })
+        return result is not None
 
-    def send_cv_prompt(self, job: Job, score: JobScore) -> None:
+    def send_cv_prompt(self, job: Job, score: JobScore) -> bool:
         """Send a standalone message with a 'generate tailored CV' button."""
         text = (
             f"🎯 <b>[{score.score}/10]</b> {_escape(job.title)}\n"
@@ -110,12 +117,13 @@ class TelegramNotifier:
         keyboard = {
             "inline_keyboard": [[{"text": "📄 CV generieren", "callback_data": f"cv:{job.refnr}"}]]
         }
-        self._call("sendMessage", {
+        result = self._call("sendMessage", {
             "chat_id": self.chat_id,
             "text": text,
             "parse_mode": "HTML",
             "reply_markup": keyboard,
         })
+        return result is not None
 
     def send_document(self, *, file_bytes: bytes, filename: str, caption: str = "") -> bool:
         files = {"document": (filename, file_bytes, "application/pdf")}
@@ -153,9 +161,12 @@ class TelegramNotifier:
         jobs: list[tuple[Job, JobScore | None]],
         *,
         total_new: int,
-    ) -> None:
+    ) -> bool:
+        """Send the multi-chunk job summary. Returns True only if *every*
+        chunk was delivered — a partial or total failure returns False so the
+        caller logs a real error instead of a false "alert sent"."""
         if not jobs:
-            return
+            return False
 
         header = (
             f"<b>🎯 arbeitsagentur-scout</b>\n"
@@ -178,5 +189,8 @@ class TelegramNotifier:
         if current:
             chunks.append(current)
 
+        all_ok = True
         for chunk in chunks:
-            self.send_text(chunk)
+            if not self.send_text(chunk):
+                all_ok = False
+        return all_ok
