@@ -75,6 +75,11 @@ class JobStorage:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
+        # WAL lets readers (the dashboard, the bot) not block on the writer
+        # (scout) and vice versa — the three processes share this one db.
+        # It's a persistent property of the file, so setting it once is enough,
+        # but re-applying on every open is harmless. (No-op for :memory: dbs.)
+        self.conn.execute("PRAGMA journal_mode=WAL")
         self.conn.executescript(SCHEMA)
         self._migrate()
         self.conn.executescript(INDEXES)

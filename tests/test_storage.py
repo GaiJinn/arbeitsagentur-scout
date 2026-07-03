@@ -23,6 +23,12 @@ def test_has_job_false_for_unseen(tmp_path):
     assert storage.has_job("unknown") is False
 
 
+def test_wal_mode_enabled(tmp_path):
+    storage = JobStorage(tmp_path / "jobs.db")
+    mode = storage.conn.execute("PRAGMA journal_mode").fetchone()[0]
+    assert mode.lower() == "wal"
+
+
 def test_save_and_has_job_round_trip(tmp_path):
     storage = JobStorage(tmp_path / "jobs.db")
     job = make_job()

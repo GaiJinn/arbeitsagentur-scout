@@ -1,0 +1,22 @@
+# Log rotation for the cron-driven scout.
+#
+# scout.py runs from host cron with output appended to /var/log/scout.log
+# (see docker-compose.yml header / the crontab line). Nothing rotates it by
+# default, so it grows unbounded. Install on the VPS:
+#
+#   sudo cp deploy/logrotate-scout /etc/logrotate.d/arbeitsagentur-scout
+#   sudo logrotate --debug /etc/logrotate.d/arbeitsagentur-scout   # dry-run
+#
+# copytruncate: scout has no long-running process to signal (it's a fresh
+# cron process each run that opens the file in append mode), so we truncate
+# the file in place after copying rather than expecting a reopen on SIGHUP.
+
+/var/log/scout.log {
+    weekly
+    rotate 8
+    compress
+    delaycompress
+    missingok
+    notifempty
+    copytruncate
+}

@@ -8,6 +8,10 @@ from __future__ import annotations
 import os
 from types import SimpleNamespace
 
+import httpx
+import pytest
+import respx
+
 os.environ.setdefault("GROQ_API_KEY", "")
 os.environ.setdefault("TELEGRAM_TOKEN", "")
 os.environ.setdefault("TELEGRAM_CHAT_ID", "")
@@ -246,6 +250,80 @@ def test_heartbeat_disabled_when_hours_zero(monkeypatch):
     notifier = RecordingNotifier()
     scout._handle_heartbeat(notifier, storage, alert_sent=False, quiet=True, total_new=1)
     assert notifier.texts == []
+
+
+def test_llm_call_cap_defers_excess_jobs(monkeypatch):
+    """With a cap of 2, only the first 2 jobs are scored; the 3rd is deferred
+    (left unsaved) so a later run picks it up instead of alerting it unscored."""
+    monkeypatch.setattr(scout, "MAX_LLM_CALLS_PER_RUN", 2)
+    _patch_queries(monkeypatch, [{"label": "q1", "params": {}}])
+    storage = FakeStorage()
+    jobs = [make_job("j1"), make_job("j2"), make_job("j3")]
+    client = FakeClient(jobs, details={"j1": "full", "j2": "full", "j3": "full"})
+    analyzer = FakeAnalyzer()
+
+    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+
+    assert analyzer.scored_refnrs == ["j1", "j2"]        # capped at 2 calls
+    assert {j.refnr for j, _ in new_jobs} == {"j1", "j2"}
+    assert not storage.has_job("j3")                     # deferred, unsaved
+
+
+def test_llm_cap_zero_means_unlimited(monkeypatch):
+    monkeypatch.setattr(scout, "MAX_LLM_CALLS_PER_RUN", 0)
+    _patch_queries(monkeypatch, [{"label": "q1", "params": {}}])
+    storage = FakeStorage()
+    jobs = [make_job("j1"), make_job("j2"), make_job("j3")]
+    client = FakeClient(jobs, details={r: "full" for r in ("j1", "j2", "j3")})
+    analyzer = FakeAnalyzer()
+
+    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    assert len(new_jobs) == 3
+    assert analyzer.scored_refnrs == ["j1", "j2", "j3"]
+
+
+def test_validate_queries_rejects_non_list():
+    with pytest.raises(SystemExit):
+        scout._validate_queries({"label": "x", "params": {}})
+
+
+def test_validate_queries_rejects_missing_label():
+    with pytest.raises(SystemExit):
+        scout._validate_queries([{"params": {}}])
+
+
+def test_validate_queries_rejects_missing_params():
+    with pytest.raises(SystemExit):
+        scout._validate_queries([{"label": "x"}])
+
+
+def test_validate_queries_accepts_valid():
+    q = [
+        {"label": "x", "params": {"was": "KI"}},
+        {"label": "y", "params": {}, "source": "greenhouse"},
+    ]
+    assert scout._validate_queries(q) == q
+
+
+@respx.mock
+def test_ping_healthcheck_hits_url(monkeypatch):
+    monkeypatch.setattr(scout, "HEALTHCHECK_URL", "https://hc.example/abc")
+    route = respx.get("https://hc.example/abc").mock(return_value=httpx.Response(200))
+    scout._ping_healthcheck()
+    assert route.called
+
+
+@respx.mock
+def test_ping_healthcheck_uses_fail_suffix(monkeypatch):
+    monkeypatch.setattr(scout, "HEALTHCHECK_URL", "https://hc.example/abc")
+    route = respx.get("https://hc.example/abc/fail").mock(return_value=httpx.Response(200))
+    scout._ping_healthcheck("/fail")
+    assert route.called
+
+
+def test_ping_healthcheck_noop_when_unset(monkeypatch):
+    monkeypatch.setattr(scout, "HEALTHCHECK_URL", "")
+    scout._ping_healthcheck()  # must not raise or make any request
 
 
 def test_query_with_unknown_source_is_skipped_not_fatal(monkeypatch):

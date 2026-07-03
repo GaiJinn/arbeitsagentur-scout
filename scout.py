@@ -18,6 +18,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
+import httpx
 from dotenv import load_dotenv
 
 from arbeitsagentur import ArbeitsagenturClient, Job
@@ -63,6 +64,21 @@ BASE_CV_PATH = Path(os.getenv("BASE_CV_PATH") or Path(__file__).parent / "cv.pdf
 HEARTBEAT_HOURS = int(os.getenv("HEARTBEAT_HOURS", "24"))
 HEARTBEAT_STATE_KEY = "last_heartbeat"
 
+# Safety valve on Groq usage: one LLM call per newly-seen job with a
+# description, so a broad query or a first run over an empty db could fire
+# hundreds of calls and blow the free-tier quota in a single run. Cap the
+# calls per run; jobs beyond the cap are left unsaved so a later run (with
+# fresh quota) picks them up instead of alerting on them unscored. 0 = no cap.
+MAX_LLM_CALLS_PER_RUN = int(os.getenv("MAX_LLM_CALLS_PER_RUN", "50"))
+
+# Optional external dead-man's switch (e.g. healthchecks.io). The in-process
+# heartbeat can't report a *total* scout crash — it dies with the process.
+# An external monitor that alerts when the ping stops does: scout GETs this
+# URL on a clean run and URL + "/fail" on a crash; the monitor's own timeout
+# catches "never pinged at all" (cron stopped, VPS down, import error). Empty
+# disables it (default), preserving prior behaviour.
+HEALTHCHECK_URL = os.getenv("HEALTHCHECK_URL", "").strip()
+
 # Search queries are loaded from a local file (gitignored) so personal
 # location/role preferences never live in source control. See
 # queries.example.json for the format — copy it to queries.json and tune
@@ -74,7 +90,27 @@ if not QUERIES_PATH.exists():
         "Copy queries.example.json to queries.json and tune it, "
         "or set QUERIES_PATH to point elsewhere."
     )
-SEARCH_QUERIES: list[dict] = json.loads(QUERIES_PATH.read_text(encoding="utf-8"))
+def _validate_queries(queries: object) -> list[dict]:
+    """Fail fast with a clear message on a malformed queries.json, instead of
+    a raw KeyError/AttributeError deep inside the pipeline mid-run."""
+    if not isinstance(queries, list):
+        sys.exit(f"{QUERIES_PATH}: top level must be a JSON array of query objects.")
+    for i, q in enumerate(queries):
+        where = f"{QUERIES_PATH} entry #{i}"
+        if not isinstance(q, dict):
+            sys.exit(f"{where}: must be an object, got {type(q).__name__}.")
+        if not isinstance(q.get("label"), str) or not q["label"].strip():
+            sys.exit(f"{where}: missing required non-empty string \"label\".")
+        if not isinstance(q.get("params"), dict):
+            sys.exit(f"{where} ({q.get('label')!r}): missing required object \"params\".")
+        if "source" in q and not isinstance(q["source"], str):
+            sys.exit(f"{where} ({q['label']!r}): \"source\" must be a string.")
+    return queries
+
+
+SEARCH_QUERIES: list[dict] = _validate_queries(
+    json.loads(QUERIES_PATH.read_text(encoding="utf-8"))
+)
 
 # ---------------------------------------------------------------------------
 # Job sources
@@ -142,6 +178,7 @@ def _collect_new_jobs(
     analyzer: LLMAnalyzer | None,
 ) -> list[tuple[Job, JobScore | None]]:
     new_jobs: list[tuple[Job, JobScore | None]] = []
+    llm_calls = 0
 
     for query in SEARCH_QUERIES:
         label = query["label"]
@@ -181,7 +218,17 @@ def _collect_new_jobs(
                     log.warning("details fetch raised for %s", job.refnr)
 
                 if detail_text:
+                    if MAX_LLM_CALLS_PER_RUN and llm_calls >= MAX_LLM_CALLS_PER_RUN:
+                        # Over budget for this run — leave the job unsaved so a
+                        # later run (fresh quota) scores it, rather than saving
+                        # it unscored and alerting on it with no score.
+                        log.warning(
+                            "LLM call cap (%d) reached — deferring %s to a later run.",
+                            MAX_LLM_CALLS_PER_RUN, job.refnr,
+                        )
+                        continue
                     job.description = detail_text
+                    llm_calls += 1
                     try:
                         score = analyzer.score(job)
                     except Exception:  # noqa: BLE001
@@ -201,6 +248,17 @@ def _collect_new_jobs(
 
 def _now_iso() -> str:
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def _ping_healthcheck(suffix: str = "") -> None:
+    """Best-effort ping to an external uptime monitor (healthchecks.io etc).
+    Never let a monitoring hiccup affect the run itself — swallow all errors."""
+    if not HEALTHCHECK_URL:
+        return
+    try:
+        httpx.get(HEALTHCHECK_URL + suffix, timeout=10.0)
+    except httpx.HTTPError as exc:
+        log.warning("Healthcheck ping failed (%s): %s", suffix or "success", exc)
 
 
 def _handle_heartbeat(
@@ -339,8 +397,14 @@ def main() -> int:
             total_new=len(new_jobs),
         )
 
+        _ping_healthcheck()  # clean run — tell the external monitor we're alive
         log.info("=== run end ===")
         return 0
+    except Exception:
+        # A crash means the external monitor should hear about it now, rather
+        # than only inferring it later from a missing success ping.
+        _ping_healthcheck("/fail")
+        raise
     finally:
         if notifier:
             notifier.close()
