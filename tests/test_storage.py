@@ -1,3 +1,5 @@
+import sqlite3
+
 from arbeitsagentur import Job
 from analyzer import JobScore
 from storage import JobStorage
@@ -97,6 +99,56 @@ def test_get_job_returns_dict_with_score_fields(tmp_path):
     assert row["employer"] == job.employer
     assert row["score"] == 9
     assert row["summary"] == "Top fit"
+
+
+def test_migrates_old_db_missing_score_columns(tmp_path):
+    """Reproduces the production outage: a db created by an older version
+    (jobs table without key_skills/fit_reasons/flags) must be migrated on
+    open so save() doesn't raise 'table jobs has no column named ...'."""
+    db_path = tmp_path / "jobs.db"
+    # Hand-build a pre-migration table: original columns only.
+    conn = sqlite3.connect(db_path)
+    conn.execute(
+        """
+        CREATE TABLE jobs (
+            refnr TEXT PRIMARY KEY,
+            title TEXT,
+            employer TEXT,
+            location TEXT,
+            posted_date TEXT,
+            seen_at TEXT NOT NULL
+        )
+        """
+    )
+    conn.execute(
+        "INSERT INTO jobs (refnr, title, seen_at) VALUES ('old-1', 'Alt', '2026-01-01')"
+    )
+    conn.commit()
+    conn.close()
+
+    # Opening via JobStorage should add the missing columns...
+    storage = JobStorage(db_path)
+    cols = {row[1] for row in storage.conn.execute("PRAGMA table_info(jobs)")}
+    assert {"key_skills", "fit_reasons", "flags", "score", "summary"} <= cols
+
+    # ...and a full save() (the call that crashed in production) now works,
+    # without dropping the pre-existing row.
+    storage.save(
+        make_job("new-1"),
+        JobScore(score=7, summary="ok", key_skills=["Python"],
+                 fit_reasons=["fit"], flags=["befristet"]),
+    )
+    assert storage.has_job("new-1") is True
+    assert storage.has_job("old-1") is True
+
+
+def test_migrate_is_idempotent_on_current_schema(tmp_path):
+    db_path = tmp_path / "jobs.db"
+    JobStorage(db_path).save(make_job("ref-1"), score=None)
+    # Re-opening (which re-runs _migrate) must not error or lose data.
+    reopened = JobStorage(db_path)
+    reopened._migrate()
+    assert reopened.has_job("ref-1") is True
 
 
 def test_bot_state_round_trip(tmp_path):

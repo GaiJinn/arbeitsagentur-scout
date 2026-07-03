@@ -34,13 +34,18 @@ CREATE TABLE IF NOT EXISTS jobs (
     seen_at         TEXT NOT NULL
 );
 
-CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
-CREATE INDEX IF NOT EXISTS idx_jobs_seen_at ON jobs(seen_at);
-
 CREATE TABLE IF NOT EXISTS bot_state (
     key   TEXT PRIMARY KEY,
     value TEXT NOT NULL
 );
+"""
+
+# Created after _migrate(), not as part of SCHEMA: on an old db that predates
+# the `score` column, CREATE INDEX ... ON jobs(score) would fail before the
+# migration has a chance to add the column.
+INDEXES = """
+CREATE INDEX IF NOT EXISTS idx_jobs_score ON jobs(score);
+CREATE INDEX IF NOT EXISTS idx_jobs_seen_at ON jobs(seen_at);
 """
 
 JOB_COLUMNS = (
@@ -49,13 +54,41 @@ JOB_COLUMNS = (
     "flags", "seen_at",
 )
 
+# Columns added to `jobs` after the first released schema. A db created by an
+# older version is missing these, and `CREATE TABLE IF NOT EXISTS` never
+# alters an existing table — so every save() into the new columns would raise
+# "table jobs has no column named ...". _migrate() adds any that are absent.
+# All are nullable, so ALTER TABLE ADD COLUMN needs no default for old rows.
+_MIGRATABLE_COLUMNS = {
+    "profession": "TEXT",
+    "url": "TEXT",
+    "description": "TEXT",
+    "score": "INTEGER",
+    "summary": "TEXT",
+    "key_skills": "TEXT",
+    "fit_reasons": "TEXT",
+    "flags": "TEXT",
+}
+
 
 class JobStorage:
     def __init__(self, db_path: Path) -> None:
         self.db_path = db_path
         self.conn = sqlite3.connect(db_path)
         self.conn.executescript(SCHEMA)
+        self._migrate()
+        self.conn.executescript(INDEXES)
         self.conn.commit()
+
+    def _migrate(self) -> None:
+        """Bring an older db up to the current `jobs` schema by adding any
+        columns introduced since it was created. Idempotent: a db already at
+        the current schema is left untouched."""
+        existing = {row[1] for row in self.conn.execute("PRAGMA table_info(jobs)")}
+        for column, coltype in _MIGRATABLE_COLUMNS.items():
+            if column not in existing:
+                log.info("Migrating jobs table: adding missing column %r", column)
+                self.conn.execute(f"ALTER TABLE jobs ADD COLUMN {column} {coltype}")
 
     def has_job(self, refnr: str) -> bool:
         cur = self.conn.execute("SELECT 1 FROM jobs WHERE refnr = ?", (refnr,))
