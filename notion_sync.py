@@ -50,6 +50,12 @@ MIN_REQUEST_INTERVAL_SECONDS = 0.35
 DATABASE_ID_KEY = "notion_database_id"
 DATABASE_TITLE = "Job Scout"
 
+# Every newly-synced job enters the "Application Pipeline" board at this stage,
+# so new hits show up in the intake column instead of an ungrouped "No Status"
+# bucket. The option is created on the fly if the Status property doesn't have
+# it yet (Notion auto-adds unknown select options on write).
+DEFAULT_STATUS = "To Apply"
+
 # Notion rich_text content is capped at 2000 chars per block.
 _MAX_RICH_TEXT_CHARS = 1900
 
@@ -158,6 +164,7 @@ class NotionSync:
                 "Seen At": {"date": {}},
                 "URL": {"url": {}},
                 "Refnr": {"rich_text": {}},
+                "Status": {"select": {}},
             },
         }
         data = self._request("POST", "/databases", json_body=body)
@@ -195,6 +202,7 @@ class NotionSync:
             "Key Skills": _multi_select(score.key_skills if score else []),
             "Flags": _multi_select(score.flags if score else []),
             "Refnr": {"rich_text": _rich_text(job.refnr)},
+            "Status": {"select": {"name": DEFAULT_STATUS}},
         }
         if score is not None:
             properties["Score"] = {"number": score.score}
