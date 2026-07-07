@@ -113,6 +113,10 @@ def _validate_queries(queries: object) -> list[dict]:
             sys.exit(f"{where} ({q.get('label')!r}): missing required object \"params\".")
         if "source" in q and not isinstance(q["source"], str):
             sys.exit(f"{where} ({q['label']!r}): \"source\" must be a string.")
+        if "region" in q and not isinstance(q["region"], str):
+            sys.exit(f"{where} ({q['label']!r}): \"region\" must be a string.")
+        if "push" in q and not isinstance(q["push"], bool):
+            sys.exit(f"{where} ({q['label']!r}): \"push\" must be true or false.")
     return queries
 
 
@@ -192,6 +196,11 @@ def _collect_new_jobs(
         label = query["label"]
         params = query["params"]
         source_name = query.get("source", DEFAULT_SOURCE)
+        # City bucket for the Notion by-city trend view, and whether hits from
+        # this query may trigger a Telegram push. Trend-only metros set
+        # push:false — scored + mirrored to Notion but never alerted.
+        region = query.get("region", "")
+        push = query.get("push", True)
         client = sources.get(source_name)
         if client is None:
             log.error(
@@ -215,6 +224,8 @@ def _collect_new_jobs(
             # call (same run, same new_jobs list) knows which JobSource this
             # came from — not persisted to SQLite, only needed within this run.
             job.extra["source"] = source_name
+            job.extra["region"] = region
+            job.extra["push"] = push
             score: JobScore | None = None
             if analyzer:
                 # Pull the full Stellenbeschreibung for richer scoring. If it
@@ -373,11 +384,15 @@ def main() -> int:
             synced = notion.sync_new_jobs(new_jobs)
             log.info("Notion sync: %d/%d new jobs synced.", synced, len(new_jobs))
 
-        # Filter for Telegram: only score-worthy ones (unscored jobs pass too).
+        # Filter for Telegram: only push-eligible (Düsseldorf) *and* score-worthy
+        # ones (unscored jobs pass the score test too). Trend-only metros
+        # (push:false) are excluded here so they never alert — they still live
+        # in Notion for the by-city trend view.
         high_value = [
             (job, score)
             for job, score in new_jobs
-            if score is None or score.score >= SCORE_THRESHOLD
+            if job.extra.get("push", True)
+            and (score is None or score.score >= SCORE_THRESHOLD)
         ]
         high_value.sort(key=lambda pair: (pair[1].score if pair[1] else 0), reverse=True)
 

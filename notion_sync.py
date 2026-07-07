@@ -165,6 +165,7 @@ class NotionSync:
                 "URL": {"url": {}},
                 "Refnr": {"rich_text": {}},
                 "Status": {"select": {}},
+                "City": {"select": {}},
             },
         }
         data = self._request("POST", "/databases", json_body=body)
@@ -194,6 +195,9 @@ class NotionSync:
             return None
 
         source = job.extra.get("source", "arbeitsagentur") if job.extra else "arbeitsagentur"
+        # City bucket (set by scout.py from the query's "region") drives the
+        # by-city trend view. Empty for jobs synced before regions existed.
+        region = job.extra.get("region", "") if job.extra else ""
         properties: dict[str, Any] = {
             "Title": {"title": _rich_text(job.title) or [{"type": "text", "text": {"content": "(ohne Titel)"}}]},
             "Employer": {"select": {"name": (job.employer or "Unbekannt")[:100]}},
@@ -204,6 +208,8 @@ class NotionSync:
             "Refnr": {"rich_text": _rich_text(job.refnr)},
             "Status": {"select": {"name": DEFAULT_STATUS}},
         }
+        if region:
+            properties["City"] = {"select": {"name": region[:100]}}
         if score is not None:
             properties["Score"] = {"number": score.score}
         if job.posted_date:
