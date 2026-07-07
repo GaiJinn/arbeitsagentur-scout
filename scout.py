@@ -384,15 +384,17 @@ def main() -> int:
             synced = notion.sync_new_jobs(new_jobs)
             log.info("Notion sync: %d/%d new jobs synced.", synced, len(new_jobs))
 
-        # Filter for Telegram: only push-eligible (Düsseldorf) *and* score-worthy
-        # ones (unscored jobs pass the score test too). Trend-only metros
-        # (push:false) are excluded here so they never alert — they still live
-        # in Notion for the by-city trend view.
+        # Filter for Telegram: push-eligible (Düsseldorf) AND actually scored at
+        # or above threshold. Unscored jobs (no Stellenbeschreibung → no LLM
+        # score, common for arbeitsagentur agency reposts) are NOT alerted —
+        # too noisy — but they're still mirrored to Notion. Trend-only metros
+        # (push:false) never alert either.
         high_value = [
             (job, score)
             for job, score in new_jobs
             if job.extra.get("push", True)
-            and (score is None or score.score >= SCORE_THRESHOLD)
+            and score is not None
+            and score.score >= SCORE_THRESHOLD
         ]
         high_value.sort(key=lambda pair: (pair[1].score if pair[1] else 0), reverse=True)
 
