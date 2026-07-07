@@ -218,6 +218,66 @@ DB_PATH=./data/jobs.db streamlit run dashboard.py
 Kept as a separate `requirements-dashboard.txt` (Streamlit + pandas) so the
 cron/bot production footprint doesn't grow just to get a browsing UI.
 
+## Sync to Notion
+
+Optionally, every new job also gets mirrored into a Notion database — one
+row per job (Title, Employer, Location, Score, Source, Key Skills, Flags,
+Posted Date, Seen At, URL), with the full LLM summary + Stellenbeschreibung
+as the page body. Click any row to read the details; use Notion's own
+grouped/board views for the aggregate look (see below) — no separate
+"stats page" to build or keep in sync.
+
+This talks to Notion's REST API directly (`notion_sync.py`, same style as
+`notifier.py`'s Telegram client), not through any chat-based Notion
+connector — `scout.py` runs unattended via cron, so it needs its own
+long-lived credential, not something tied to an interactive session.
+
+### 1. Create a Notion integration
+
+1. Go to [notion.so/my-integrations](https://www.notion.so/my-integrations) → **New integration**.
+2. Give it a name (e.g. "arbeitsagentur-scout"), pick your workspace, save.
+3. Copy the **Internal Integration Token** → this is `NOTION_API_KEY`.
+
+### 2. Share a page with it
+
+1. In Notion, create (or pick) a page that will hold the "Job Scout"
+   database — a fresh empty page is cleanest.
+2. Open it, click `···` → **Connections** (or **Add connections**) → select
+   the integration you just created.
+3. Copy the page's id from its URL: `notion.so/My-Page-<32-hex-chars>` — the
+   32 hex characters (no dashes needed) are `NOTION_PARENT_PAGE_ID`.
+
+### 3. Configure and run
+
+Set both in `.env`:
+
+```bash
+NOTION_API_KEY=secret_xxx...
+NOTION_PARENT_PAGE_ID=xxxxxxxxxxxxxxxxxxxxxxxxxxxxxxxx
+```
+
+The "Job Scout" database is created automatically under that page on the
+first run after this is configured — nothing to set up by hand in Notion
+beyond sharing the parent page. Its id (and each synced job's page id) is
+cached in the shared `jobs.db` so re-runs never create duplicate rows.
+
+### Getting the "汇总" / grouped overview
+
+Once the database exists (after the first run with Notion configured), open
+it in Notion and add a view grouped the way you want — this is a one-time,
+no-code step Notion already does well, so `notion_sync.py` doesn't try to
+duplicate it via the API:
+
+- **Board view, grouped by Employer or Source** — see companies/portals at a
+  glance, click into any card for full details.
+- **Table view, grouped by Score** — click the "..." menu → Group → Score to
+  see counts per score band.
+- **Sort by Seen At descending** — a simple "what's new" feed.
+
+A Notion outage or misconfiguration never affects the actual job search /
+scoring / Telegram alert — sync failures are logged and swallowed, not
+raised (see `notion_sync.py`'s `sync_new_jobs`).
+
 ## Watching specific companies
 
 Besides arbeitsagentur.de, `scout.py` can watch individual companies'
@@ -363,6 +423,7 @@ arbeitsagentur-scout/
 ├── notifier.py         # Telegram bot output (messages, buttons, documents)
 ├── storage.py          # SQLite dedup + history + bot poll offset
 ├── dashboard.py         # Optional read-only Streamlit UI over jobs.db
+├── notion_sync.py       # Optional: mirror new jobs into a Notion database
 ├── tests/              # pytest suite (mocked APIs, no network needed)
 │   └── test_integration.py  # end-to-end scout.main() run, all HTTP mocked
 ├── .github/workflows/  # CI — runs the test suite on every push
@@ -388,6 +449,7 @@ arbeitsagentur-scout/
 - [x] Test suite + CI
 - [x] Auto-generate tailored CVs for high-scoring jobs (Telegram button)
 - [x] Streamlit UI to browse historical scores
+- [x] Sync job history to a Notion database (see [Sync to Notion](#sync-to-notion))
 - [x] Retry/backoff on Groq rate limits and malformed JSON
 - [x] `JobSource` abstraction for multi-portal support
 - [x] Watch specific companies' career pages via Greenhouse/Lever/Personio's

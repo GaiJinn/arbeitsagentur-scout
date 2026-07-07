@@ -23,6 +23,7 @@ from storage import JobStorage
 
 TELEGRAM_BASE = "https://api.telegram.org/botfake-telegram-token"
 GROQ_CHAT_URL = "https://api.groq.com/openai/v1/chat/completions"
+NOTION_BASE = "https://api.notion.com/v1"
 
 
 def _configure(monkeypatch, tmp_path, *, queries):
@@ -149,3 +150,79 @@ def test_main_second_run_does_not_rescan_already_seen_job(monkeypatch, tmp_path)
     assert scout.main() == 0
     assert groq_route.call_count == 0  # job already in db — never re-scored
     assert telegram_route.call_count == 0  # nothing new — no alert sent
+
+
+@respx.mock
+def test_main_syncs_new_jobs_to_notion_when_configured(monkeypatch, tmp_path):
+    db_path = _configure(monkeypatch, tmp_path, queries=[
+        {"label": "Werkstudent KI Berlin", "params": {"was": "KI", "wo": "Berlin"}},
+    ])
+    monkeypatch.setattr(scout, "NOTION_API_KEY", "fake-notion-key")
+    monkeypatch.setattr(scout, "NOTION_PARENT_PAGE_ID", "parent-page-1")
+
+    respx.get(f"{API_BASE}/jobs").mock(return_value=httpx.Response(200, json={
+        "stellenangebote": [{
+            "refnr": "notion-1",
+            "titel": "Werkstudent KI",
+            "arbeitgeber": "Beispiel GmbH",
+            "arbeitsort": {"ort": "Berlin"},
+            "aktuelleVeroeffentlichungsdatum": "2026-06-01",
+            "beruf": "Informatiker",
+        }],
+    }))
+    encoded_refnr = base64.b64encode(b"notion-1").decode()
+    respx.get(f"{API_BASE}/jobdetails/{encoded_refnr}").mock(
+        return_value=httpx.Response(200, json={"stellenbeschreibung": "Volltext."})
+    )
+    respx.post(GROQ_CHAT_URL).mock(return_value=httpx.Response(200, json={
+        "choices": [{"message": {"content": json.dumps({"score": 8, "summary": "ok"})}}]
+    }))
+    respx.post(f"{TELEGRAM_BASE}/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+    )
+    db_route = respx.post(f"{NOTION_BASE}/databases").mock(
+        return_value=httpx.Response(200, json={"id": "notion-db-1"})
+    )
+    page_route = respx.post(f"{NOTION_BASE}/pages").mock(
+        return_value=httpx.Response(200, json={"id": "notion-page-1"})
+    )
+
+    assert scout.main() == 0
+    assert db_route.call_count == 1
+    assert page_route.call_count == 1
+
+    storage = JobStorage(db_path)
+    assert storage.get_bot_state("notion_database_id") == "notion-db-1"
+    assert storage.get_bot_state("notion_page:notion-1") == "notion-page-1"
+
+
+@respx.mock
+def test_main_does_not_call_notion_when_unconfigured(monkeypatch, tmp_path):
+    """Default state (no NOTION_API_KEY/NOTION_PARENT_PAGE_ID) — scout.main()
+    must not touch the Notion API at all."""
+    _configure(monkeypatch, tmp_path, queries=[
+        {"label": "Werkstudent KI Berlin", "params": {"was": "KI", "wo": "Berlin"}},
+    ])
+    assert scout.NOTION_API_KEY is None or scout.NOTION_API_KEY == ""
+
+    respx.get(f"{API_BASE}/jobs").mock(return_value=httpx.Response(200, json={
+        "stellenangebote": [{
+            "refnr": "no-notion-1", "titel": "Werkstudent", "arbeitgeber": "X",
+            "arbeitsort": {"ort": "Berlin"}, "aktuelleVeroeffentlichungsdatum": "2026-06-01",
+        }],
+    }))
+    encoded_refnr = base64.b64encode(b"no-notion-1").decode()
+    respx.get(f"{API_BASE}/jobdetails/{encoded_refnr}").mock(
+        return_value=httpx.Response(200, json={"stellenbeschreibung": "Volltext."})
+    )
+    respx.post(GROQ_CHAT_URL).mock(return_value=httpx.Response(200, json={
+        "choices": [{"message": {"content": json.dumps({"score": 8, "summary": "ok"})}}]
+    }))
+    respx.post(f"{TELEGRAM_BASE}/sendMessage").mock(
+        return_value=httpx.Response(200, json={"ok": True, "result": {"message_id": 1}})
+    )
+    # No route registered for api.notion.com at all — respx.mock() raises if
+    # anything actually tries to hit an unmocked URL, so this fails loudly
+    # if scout.main() calls Notion despite being unconfigured.
+
+    assert scout.main() == 0

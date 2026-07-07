@@ -26,6 +26,7 @@ from analyzer import LLMAnalyzer, JobScore
 from ats_sources import GreenhouseSource, LeverSource, PersonioSource
 from job_source import JobSource
 from notifier import TelegramNotifier
+from notion_sync import NotionSync
 from storage import JobStorage
 
 # ---------------------------------------------------------------------------
@@ -46,6 +47,13 @@ DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 GROQ_API_KEY = os.getenv("GROQ_API_KEY")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
+
+# Optional: mirror every new job into a Notion database (see notion_sync.py
+# and README "Sync to Notion"). Both unset (default) → skipped entirely,
+# same "if analyzer/notifier is None, just don't do that part" pattern as
+# GROQ_API_KEY/TELEGRAM_TOKEN above.
+NOTION_API_KEY = os.getenv("NOTION_API_KEY")
+NOTION_PARENT_PAGE_ID = os.getenv("NOTION_PARENT_PAGE_ID")
 
 # Minimum LLM score (1-10) for a job to trigger a Telegram alert.
 SCORE_THRESHOLD = int(os.getenv("SCORE_THRESHOLD", "6"))
@@ -203,6 +211,10 @@ def _collect_new_jobs(
         for job in results:
             if storage.has_job(job.refnr):
                 continue
+            # Stamped on the in-memory Job so a later notion_sync.sync_job
+            # call (same run, same new_jobs list) knows which JobSource this
+            # came from — not persisted to SQLite, only needed within this run.
+            job.extra["source"] = source_name
             score: JobScore | None = None
             if analyzer:
                 # Pull the full Stellenbeschreibung for richer scoring. If it
@@ -313,11 +325,20 @@ def main() -> int:
         if TELEGRAM_TOKEN and TELEGRAM_CHAT_ID
         else None
     )
+    notion = (
+        NotionSync(api_key=NOTION_API_KEY, parent_page_id=NOTION_PARENT_PAGE_ID, storage=storage)
+        if NOTION_API_KEY and NOTION_PARENT_PAGE_ID
+        else None
+    )
 
     if analyzer is None:
         log.warning("GROQ_API_KEY not set — running without LLM analysis.")
     if notifier is None:
         log.warning("Telegram credentials missing — output to console only.")
+    if notion is None and (NOTION_API_KEY or NOTION_PARENT_PAGE_ID):
+        # Only one of the two set is almost certainly a config mistake, not
+        # an intentional "feature off" — worth a louder warning than silence.
+        log.warning("NOTION_API_KEY and NOTION_PARENT_PAGE_ID must both be set — Notion sync disabled.")
 
     # Only spin up the sources actually referenced by queries.json (usually
     # just "arbeitsagentur"), so adding a second portal later doesn't require
@@ -342,6 +363,15 @@ def main() -> int:
         log.info("New jobs total: %d", len(new_jobs))
         if not new_jobs:
             log.info("Nothing new this run.")
+
+        # Mirror the full new-jobs history into Notion — not just the
+        # high-value ones below, same "keep everything, filter in the
+        # viewer" philosophy as the SQLite db / Streamlit dashboard. Never
+        # allowed to affect the Telegram alert path: a Notion outage is
+        # logged and swallowed inside sync_new_jobs, not raised here.
+        if notion and new_jobs:
+            synced = notion.sync_new_jobs(new_jobs)
+            log.info("Notion sync: %d/%d new jobs synced.", synced, len(new_jobs))
 
         # Filter for Telegram: only score-worthy ones (unscored jobs pass too).
         high_value = [
@@ -408,6 +438,8 @@ def main() -> int:
     finally:
         if notifier:
             notifier.close()
+        if notion:
+            notion.close()
 
 
 if __name__ == "__main__":
