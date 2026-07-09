@@ -31,7 +31,8 @@ from storage import JobStorage
 # ---------------------------------------------------------------------------
 
 ENV_FILE = Path(__file__).parent / ".env"
-if ENV_FILE.exists():
+# Same test-hermeticity guard as scout.py — see tests/conftest.py.
+if ENV_FILE.exists() and os.getenv("SCOUT_SKIP_DOTENV") != "1":
     load_dotenv(ENV_FILE)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()

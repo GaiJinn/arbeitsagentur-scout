@@ -1,8 +1,14 @@
 """One-off manual check: confirm NOTION_API_KEY / NOTION_PARENT_PAGE_ID in
 .env are valid and the integration can create a database under your page.
 
-Run locally (not in scout.py's test suite):
-    python test_notion_connection.py
+NOT a pytest test — it loads the real .env and talks to the live Notion API
+at import time. It used to be named test_notion_connection.py, which made a
+bare `pytest` run collect it: that leaked the production Notion key into the
+test process and called the real API during collection. Hence the rename
+(plus `testpaths = tests` in pytest.ini).
+
+Run locally:
+    python notion_connection_check.py
 
 Safe to run multiple times — the database id gets cached in jobs.db's
 bot_state table after the first successful run, so a second run just

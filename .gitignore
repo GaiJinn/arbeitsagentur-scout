@@ -1,6 +1,10 @@
+# Secrets & personal data — also covers backups like .env.bak or
+# queries.json.bak-YYYYMMDD, so a careless `git add -A` can't publish them.
 .env
+.env.*
+!.env.example
 profile.md
-queries.json
+queries.json*
 cv.pdf
 .venv/
 __pycache__/

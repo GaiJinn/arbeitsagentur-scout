@@ -34,7 +34,11 @@ from storage import JobStorage
 # ---------------------------------------------------------------------------
 
 ENV_FILE = Path(__file__).parent / ".env"
-if ENV_FILE.exists():
+# SCOUT_SKIP_DOTENV is set by tests/conftest.py: on a machine with a populated
+# production .env, loading it at import time would leak real keys into the
+# test process and flip config-dependent code paths (e.g. Notion sync),
+# making the suite pass in CI but fail locally. Normal runs are unaffected.
+if ENV_FILE.exists() and os.getenv("SCOUT_SKIP_DOTENV") != "1":
     load_dotenv(ENV_FILE)
 
 LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
