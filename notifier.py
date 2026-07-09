@@ -22,8 +22,14 @@ MAX_MESSAGE_CHARS = 3800  # below the 4096 hard limit, with margin
 
 
 def _escape(text: str) -> str:
-    """HTML-escape (we use parse_mode=HTML so links render as buttons)."""
-    return html.escape(text or "", quote=False)
+    """HTML-escape (we use parse_mode=HTML so links render as buttons).
+
+    quote=True matters because job URLs are interpolated into an
+    href="..." attribute: an unescaped `"` in a (source-controlled!) URL
+    would terminate the attribute early and truncate the link. Telegram
+    renders the &quot;/&#x27; entities fine in body text too.
+    """
+    return html.escape(text or "", quote=True)
 
 
 def _format_job(job: Job, score: JobScore | None) -> str:

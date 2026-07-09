@@ -11,6 +11,29 @@ TOKEN = "test-token"
 API_BASE = f"https://api.telegram.org/bot{TOKEN}"
 
 
+def test_escape_neutralizes_quotes_in_href():
+    # Job URLs land inside an href="..." attribute. An unescaped `"` would
+    # terminate the attribute early and truncate the link; `<`/`>` could
+    # open rogue tags. _escape(quote=True) must neutralize all of them.
+    from notifier import _escape, _format_job
+
+    assert _escape('a"b') == "a&quot;b"
+    assert _escape("a'b") == "a&#x27;b"
+
+    job = Job(
+        refnr="ref-q",
+        title='Dev "Backend" <m/w/d>',
+        employer="Beispiel GmbH",
+        location="Düsseldorf",
+        posted_date="2026-06-01",
+        url='https://example.com/job?q="x"',
+    )
+    text = _format_job(job, JobScore(score=8, summary="ok"))
+    assert '"https://example.com/job?q=&quot;x&quot;"' in text
+    assert 'q="x"' not in text  # raw quote must never reach the attribute
+    assert "&lt;m/w/d&gt;" in text
+
+
 def make_job(refnr: str = "ref-1") -> Job:
     return Job(
         refnr=refnr,
