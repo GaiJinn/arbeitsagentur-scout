@@ -85,7 +85,7 @@ def test_skips_already_seen_jobs(monkeypatch):
     client = FakeClient([make_job("job-1")], details={})
     analyzer = FakeAnalyzer()
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
 
     assert new_jobs == []
     assert analyzer.scored_refnrs == []
@@ -100,7 +100,7 @@ def test_scores_job_when_details_available(monkeypatch):
     )
     analyzer = FakeAnalyzer(fixed_score=9)
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
 
     assert len(new_jobs) == 1
     job, score = new_jobs[0]
@@ -119,7 +119,7 @@ def test_skips_scoring_when_details_fetch_returns_empty(monkeypatch):
     client = FakeClient([make_job("job-1")], details={})  # no detail text
     analyzer = FakeAnalyzer()
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
 
     assert len(new_jobs) == 1
     job, score = new_jobs[0]
@@ -140,7 +140,7 @@ def test_skips_scoring_when_details_fetch_raises(monkeypatch):
     client = RaisingClient([make_job("job-1")], details={})
     analyzer = FakeAnalyzer()
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
 
     assert len(new_jobs) == 1
     _, score = new_jobs[0]
@@ -153,11 +153,72 @@ def test_no_analyzer_saves_job_unscored(monkeypatch):
     storage = FakeStorage()
     client = FakeClient([make_job("job-1")], details={"job-1": "full text"})
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer=None)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer=None)
 
     assert len(new_jobs) == 1
     _, score = new_jobs[0]
     assert score is None
+
+
+def test_known_job_reseen_with_region_becomes_region_sighting(monkeypatch):
+    """A multi-location posting already claimed by an earlier query must not
+    be re-saved, but its (refnr, region) sighting is reported so notion_sync
+    can append the city to the existing page."""
+    _patch_queries(monkeypatch, [{"label": "q-berlin", "region": "Berlin", "params": {}}])
+    storage = FakeStorage()
+    storage.seen.add("job-1")
+    client = FakeClient([make_job("job-1")], details={})
+    analyzer = FakeAnalyzer()
+
+    new_jobs, sightings = scout._collect_new_jobs(_sources(client), storage, analyzer)
+
+    assert new_jobs == []
+    assert sightings == [("job-1", "Berlin")]
+    assert analyzer.scored_refnrs == []
+
+
+def test_known_job_reseen_without_region_reports_nothing(monkeypatch):
+    _patch_queries(monkeypatch, [{"label": "q1", "params": {}}])  # no "region"
+    storage = FakeStorage()
+    storage.seen.add("job-1")
+    client = FakeClient([make_job("job-1")], details={})
+
+    new_jobs, sightings = scout._collect_new_jobs(_sources(client), storage, None)
+
+    assert new_jobs == []
+    assert sightings == []
+
+
+def test_region_sightings_deduped_within_run(monkeypatch):
+    _patch_queries(monkeypatch, [
+        {"label": "q-berlin-a", "region": "Berlin", "params": {"was": "KI"}},
+        {"label": "q-berlin-b", "region": "Berlin", "params": {"was": "LLM"}},
+    ])
+    storage = FakeStorage()
+    storage.seen.add("job-1")
+    client = FakeClient([make_job("job-1")], details={})
+
+    _, sightings = scout._collect_new_jobs(_sources(client), storage, None)
+
+    assert sightings == [("job-1", "Berlin")]  # once, not per query
+
+
+def test_new_job_not_reported_as_region_sighting(monkeypatch):
+    """A job first seen this run is saved + synced with its own region; only
+    *pre-existing* jobs become sightings — but a second query re-seeing the
+    just-saved job in another city does."""
+    _patch_queries(monkeypatch, [
+        {"label": "q-muenchen", "region": "München", "params": {"was": "KI"}},
+        {"label": "q-berlin", "region": "Berlin", "params": {"was": "KI"}},
+    ])
+    storage = FakeStorage()
+    client = FakeClient([make_job("job-1")], details={"job-1": "full text"})
+
+    new_jobs, sightings = scout._collect_new_jobs(_sources(client), storage, None)
+
+    assert [j.refnr for j, _ in new_jobs] == ["job-1"]
+    assert new_jobs[0][0].extra["region"] == "München"  # first query wins the page
+    assert sightings == [("job-1", "Berlin")]  # second query adds its city
 
 
 def test_search_failure_for_one_query_does_not_abort_others(monkeypatch):
@@ -177,7 +238,7 @@ def test_search_failure_for_one_query_does_not_abort_others(monkeypatch):
     storage = FakeStorage()
     analyzer = FakeAnalyzer()
 
-    new_jobs = scout._collect_new_jobs(_sources(FlakyClient()), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(FlakyClient()), storage, analyzer)
 
     assert len(new_jobs) == 1
     assert new_jobs[0][0].refnr == "job-2"
@@ -262,7 +323,7 @@ def test_llm_call_cap_defers_excess_jobs(monkeypatch):
     client = FakeClient(jobs, details={"j1": "full", "j2": "full", "j3": "full"})
     analyzer = FakeAnalyzer()
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
 
     assert analyzer.scored_refnrs == ["j1", "j2"]        # capped at 2 calls
     assert {j.refnr for j, _ in new_jobs} == {"j1", "j2"}
@@ -277,7 +338,7 @@ def test_llm_cap_zero_means_unlimited(monkeypatch):
     client = FakeClient(jobs, details={r: "full" for r in ("j1", "j2", "j3")})
     analyzer = FakeAnalyzer()
 
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
     assert len(new_jobs) == 3
     assert analyzer.scored_refnrs == ["j1", "j2", "j3"]
 
@@ -336,7 +397,7 @@ def test_query_with_unknown_source_is_skipped_not_fatal(monkeypatch):
     analyzer = FakeAnalyzer()
 
     # Only "arbeitsagentur" is configured — "stepstone" isn't in `sources`.
-    new_jobs = scout._collect_new_jobs(_sources(client), storage, analyzer)
+    new_jobs, _ = scout._collect_new_jobs(_sources(client), storage, analyzer)
 
     assert len(new_jobs) == 1
     assert new_jobs[0][0].refnr == "job-3"

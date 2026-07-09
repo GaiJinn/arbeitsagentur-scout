@@ -23,6 +23,7 @@ Notion"). If either is unset, scout.py simply skips this step.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from datetime import datetime, timezone
@@ -49,6 +50,14 @@ MIN_REQUEST_INTERVAL_SECONDS = 0.35
 
 DATABASE_ID_KEY = "notion_database_id"
 DATABASE_TITLE = "Job Scout"
+
+# One-time schema migration marker: City started life as a `select`, but a
+# multi-location posting (one refnr, many Arbeitsorte — big consultancies,
+# agencies, remote roles) is genuinely offered in several cities at once, so
+# it became a `multi_select`. Databases created before that are converted in
+# place on the first run after upgrade; this flag keeps it to a single
+# GET/PATCH ever, not one per run.
+CITY_MULTI_SELECT_KEY = "notion_city_is_multi_select"
 
 # Every newly-synced job enters the "Application Pipeline" board at this stage,
 # so new hits show up in the intake column instead of an ungrouped "No Status"
@@ -146,6 +155,7 @@ class NotionSync:
         """Return the target database's id, creating it once if needed."""
         cached = self.storage.get_bot_state(DATABASE_ID_KEY)
         if cached:
+            self._ensure_city_multi_select(cached)
             return cached
 
         log.info("No Notion database cached yet — creating %r under parent page.", DATABASE_TITLE)
@@ -165,18 +175,39 @@ class NotionSync:
                 "URL": {"url": {}},
                 "Refnr": {"rich_text": {}},
                 "Status": {"select": {}},
-                "City": {"select": {}},
+                "City": {"multi_select": {}},
             },
         }
         data = self._request("POST", "/databases", json_body=body)
         database_id = data["id"]
         self.storage.set_bot_state(DATABASE_ID_KEY, database_id)
+        self.storage.set_bot_state(CITY_MULTI_SELECT_KEY, "1")
         log.info("Created Notion database %s", database_id)
         return database_id
+
+    def _ensure_city_multi_select(self, database_id: str) -> None:
+        """Convert a pre-existing City `select` property to `multi_select`.
+        Notion converts the options and every page's current value in place,
+        exactly like changing the property type in the UI. Idempotent and
+        run at most once (see CITY_MULTI_SELECT_KEY)."""
+        if self.storage.get_bot_state(CITY_MULTI_SELECT_KEY):
+            return
+        data = self._request("GET", f"/databases/{database_id}")
+        city = data.get("properties", {}).get("City", {})
+        if city.get("type") == "select":
+            self._request(
+                "PATCH", f"/databases/{database_id}",
+                json_body={"properties": {"City": {"multi_select": {}}}},
+            )
+            log.info("Migrated Notion City property from select to multi_select.")
+        self.storage.set_bot_state(CITY_MULTI_SELECT_KEY, "1")
 
     # -- job sync ---------------------------------------------------------------
     def _page_cache_key(self, refnr: str) -> str:
         return f"notion_page:{refnr}"
+
+    def _region_cache_key(self, refnr: str) -> str:
+        return f"notion_regions:{refnr}"
 
     def sync_job(self, database_id: str, job: Job, score: JobScore | None) -> str | None:
         """Create a Notion page/row for one job, unless it's already synced.
@@ -197,6 +228,9 @@ class NotionSync:
         source = job.extra.get("source", "arbeitsagentur") if job.extra else "arbeitsagentur"
         # City bucket (set by scout.py from the query's "region") drives the
         # by-city trend view. Empty for jobs synced before regions existed.
+        # A multi_select because one posting can be offered in several cities;
+        # further cities are appended later via add_job_region when another
+        # query re-sees the same refnr.
         region = job.extra.get("region", "") if job.extra else ""
         properties: dict[str, Any] = {
             "Title": {"title": _rich_text(job.title) or [{"type": "text", "text": {"content": "(ohne Titel)"}}]},
@@ -209,7 +243,7 @@ class NotionSync:
             "Status": {"select": {"name": DEFAULT_STATUS}},
         }
         if region:
-            properties["City"] = {"select": {"name": region[:100]}}
+            properties["City"] = _multi_select([region])
         if score is not None:
             properties["Score"] = {"number": score.score}
         if job.posted_date:
@@ -232,6 +266,8 @@ class NotionSync:
         data = self._request("POST", "/pages", json_body=body)
         page_id = data["id"]
         self.storage.set_bot_state(cache_key, page_id)
+        if region:
+            self.storage.set_bot_state(self._region_cache_key(job.refnr), json.dumps([region]))
         return page_id
 
     def sync_new_jobs(self, jobs: list[tuple[Job, JobScore | None]]) -> int:
@@ -255,6 +291,75 @@ class NotionSync:
             if page_id:
                 synced += 1
         return synced
+
+    # -- multi-city postings -----------------------------------------------------
+    def add_job_region(self, refnr: str, region: str) -> bool:
+        """Append `region` to an already-synced job's City multi-select.
+
+        Multi-location postings carry one refnr but appear in several city
+        searches; whichever query runs first creates the page with its own
+        City, and this fills in the other cities as later queries re-see the
+        job. The page's known cities are cached locally (bot_state,
+        notion_regions:{refnr}) so a job re-seen every run costs zero API
+        calls once its cities are known; pages synced before the cache
+        existed are read from Notion once.
+
+        Returns True only when the page was actually updated."""
+        page_id = self.storage.get_bot_state(self._page_cache_key(refnr))
+        if not page_id:
+            return False  # never synced (predates Notion, or its sync failed)
+
+        cache_key = self._region_cache_key(refnr)
+        cached = self.storage.get_bot_state(cache_key)
+        if cached:
+            regions = json.loads(cached)
+        else:
+            data = self._request("GET", f"/pages/{page_id}")
+            city = data.get("properties", {}).get("City", {})
+            # multi_select after the schema migration; tolerate a select
+            # value in case the page is read before the migration ran.
+            if city.get("type") == "multi_select":
+                regions = [opt.get("name", "") for opt in city.get("multi_select", [])]
+            elif city.get("type") == "select":
+                regions = [(city.get("select") or {}).get("name", "")]
+            else:
+                regions = []
+            regions = [r for r in regions if r]
+
+        if region not in regions:
+            regions.append(region)
+            self._request(
+                "PATCH", f"/pages/{page_id}",
+                json_body={"properties": {"City": _multi_select(regions)}},
+            )
+            self.storage.set_bot_state(cache_key, json.dumps(regions))
+            return True
+        self.storage.set_bot_state(cache_key, json.dumps(regions))
+        return False
+
+    def update_job_regions(self, updates: list[tuple[str, str]]) -> int:
+        """Apply add_job_region for every (refnr, region) sighting of an
+        already-known job. Never raises — same contract as sync_new_jobs.
+        Returns how many pages actually gained a city."""
+        if not updates:
+            return 0
+        database_id = self.storage.get_bot_state(DATABASE_ID_KEY)
+        if not database_id:
+            return 0  # no database yet → none of these jobs has a page
+        try:
+            self._ensure_city_multi_select(database_id)
+        except (NotionSyncError, httpx.HTTPError) as exc:
+            log.warning("Could not migrate City to multi_select — skipping City updates this run: %s", exc)
+            return 0
+
+        updated = 0
+        for refnr, region in updates:
+            try:
+                if self.add_job_region(refnr, region):
+                    updated += 1
+            except (NotionSyncError, httpx.HTTPError):
+                log.exception("Notion City update failed for job %s — skipping.", refnr)
+        return updated
 
 
 def _paragraph_block(text: str) -> dict:

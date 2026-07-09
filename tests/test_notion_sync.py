@@ -102,6 +102,60 @@ def test_ensure_database_sends_expected_schema(sync):
         assert prop in payload["properties"]
 
 
+# -- City select → multi_select migration --------------------------------------
+
+@respx.mock
+def test_ensure_database_migrates_city_select_to_multi_select(sync, storage):
+    storage.set_bot_state("notion_database_id", "db-abc")
+    get_route = respx.get(f"{API_BASE}/databases/db-abc").mock(
+        return_value=httpx.Response(200, json={
+            "id": "db-abc",
+            "properties": {"City": {"type": "select", "select": {"options": []}}},
+        })
+    )
+    patch_route = respx.patch(f"{API_BASE}/databases/db-abc").mock(
+        return_value=httpx.Response(200, json={"id": "db-abc"})
+    )
+
+    assert sync.ensure_database() == "db-abc"
+    assert get_route.call_count == 1
+    assert patch_route.call_count == 1
+    import json as _json
+    payload = _json.loads(patch_route.calls[0].request.content)
+    assert payload == {"properties": {"City": {"multi_select": {}}}}
+
+    # Migration is one-time: the flag short-circuits every later call.
+    assert sync.ensure_database() == "db-abc"
+    assert get_route.call_count == 1
+    assert patch_route.call_count == 1
+
+
+@respx.mock
+def test_ensure_database_migration_noop_when_already_multi_select(sync, storage):
+    storage.set_bot_state("notion_database_id", "db-abc")
+    respx.get(f"{API_BASE}/databases/db-abc").mock(
+        return_value=httpx.Response(200, json={
+            "id": "db-abc",
+            "properties": {"City": {"type": "multi_select", "multi_select": {"options": []}}},
+        })
+    )
+    patch_route = respx.patch(f"{API_BASE}/databases/db-abc").mock(
+        return_value=httpx.Response(200, json={"id": "db-abc"})
+    )
+
+    sync.ensure_database()
+    assert patch_route.call_count == 0
+    assert storage.get_bot_state("notion_city_is_multi_select") == "1"
+
+
+@respx.mock
+def test_freshly_created_database_needs_no_migration(sync, storage):
+    respx.post(f"{API_BASE}/databases").mock(return_value=httpx.Response(200, json={"id": "db-abc"}))
+    sync.ensure_database()
+    # Created with multi_select from the start — flag set so no GET ever runs.
+    assert storage.get_bot_state("notion_city_is_multi_select") == "1"
+
+
 # -- sync_job -----------------------------------------------------------------
 
 @respx.mock
@@ -175,6 +229,124 @@ def test_sync_job_omits_empty_posted_date_and_url(sync):
     payload = _json.loads(route.calls[0].request.content)
     assert "Posted Date" not in payload["properties"]
     assert "URL" not in payload["properties"]
+
+
+@respx.mock
+def test_sync_job_writes_city_as_multi_select_and_seeds_region_cache(sync, storage):
+    route = respx.post(f"{API_BASE}/pages").mock(return_value=httpx.Response(200, json={"id": "page-1"}))
+    job = make_job()
+    job.extra["region"] = "Berlin"
+    sync.sync_job("db-abc", job, None)
+
+    import json as _json
+    payload = _json.loads(route.calls[0].request.content)
+    assert payload["properties"]["City"] == {"multi_select": [{"name": "Berlin"}]}
+    assert storage.get_bot_state("notion_regions:job-1") == '["Berlin"]'
+
+
+@respx.mock
+def test_sync_job_omits_city_without_region(sync, storage):
+    route = respx.post(f"{API_BASE}/pages").mock(return_value=httpx.Response(200, json={"id": "page-1"}))
+    sync.sync_job("db-abc", make_job(), None)
+
+    import json as _json
+    payload = _json.loads(route.calls[0].request.content)
+    assert "City" not in payload["properties"]
+    assert storage.get_bot_state("notion_regions:job-1") is None
+
+
+# -- add_job_region / update_job_regions ----------------------------------------
+
+@respx.mock
+def test_add_job_region_skips_job_without_page(sync):
+    # Never synced to Notion → nothing to update, no API calls at all.
+    assert sync.add_job_region("job-1", "Berlin") is False
+
+
+@respx.mock
+def test_add_job_region_appends_city_reading_page_once(sync, storage):
+    """Cache miss (page synced before the region cache existed): read the
+    page's current City from Notion once, append, and cache the result."""
+    storage.set_bot_state("notion_page:job-1", "page-1")
+    get_route = respx.get(f"{API_BASE}/pages/page-1").mock(
+        return_value=httpx.Response(200, json={
+            "id": "page-1",
+            "properties": {"City": {"type": "multi_select",
+                                    "multi_select": [{"name": "München"}]}},
+        })
+    )
+    patch_route = respx.patch(f"{API_BASE}/pages/page-1").mock(
+        return_value=httpx.Response(200, json={"id": "page-1"})
+    )
+
+    assert sync.add_job_region("job-1", "Berlin") is True
+    assert get_route.call_count == 1
+    import json as _json
+    payload = _json.loads(patch_route.calls[0].request.content)
+    assert payload["properties"]["City"]["multi_select"] == [
+        {"name": "München"}, {"name": "Berlin"},
+    ]
+    assert _json.loads(storage.get_bot_state("notion_regions:job-1")) == ["München", "Berlin"]
+
+    # Same sighting again: served from the local cache, zero API calls.
+    assert sync.add_job_region("job-1", "Berlin") is False
+    assert get_route.call_count == 1
+    assert patch_route.call_count == 1
+
+
+@respx.mock
+def test_add_job_region_reads_legacy_select_city(sync, storage):
+    """A page value still typed select (read before the schema migration ran)
+    is treated as a one-city list, not dropped."""
+    storage.set_bot_state("notion_page:job-1", "page-1")
+    respx.get(f"{API_BASE}/pages/page-1").mock(
+        return_value=httpx.Response(200, json={
+            "id": "page-1",
+            "properties": {"City": {"type": "select", "select": {"name": "Düsseldorf"}}},
+        })
+    )
+    patch_route = respx.patch(f"{API_BASE}/pages/page-1").mock(
+        return_value=httpx.Response(200, json={"id": "page-1"})
+    )
+
+    assert sync.add_job_region("job-1", "Berlin") is True
+    import json as _json
+    payload = _json.loads(patch_route.calls[0].request.content)
+    assert payload["properties"]["City"]["multi_select"] == [
+        {"name": "Düsseldorf"}, {"name": "Berlin"},
+    ]
+
+
+@respx.mock
+def test_add_job_region_noop_when_city_already_present(sync, storage):
+    storage.set_bot_state("notion_page:job-1", "page-1")
+    storage.set_bot_state("notion_regions:job-1", '["Berlin"]')
+    assert sync.add_job_region("job-1", "Berlin") is False  # no routes → no calls
+
+
+@respx.mock
+def test_update_job_regions_returns_zero_without_database(sync):
+    # No database id cached → no pages can exist; must not create a database.
+    assert sync.update_job_regions([("job-1", "Berlin")]) == 0
+
+
+@respx.mock
+def test_update_job_regions_continues_after_one_failure(sync, storage):
+    storage.set_bot_state("notion_database_id", "db-abc")
+    storage.set_bot_state("notion_city_is_multi_select", "1")
+    storage.set_bot_state("notion_page:job-bad", "page-bad")
+    storage.set_bot_state("notion_regions:job-bad", '["München"]')
+    storage.set_bot_state("notion_page:job-ok", "page-ok")
+    storage.set_bot_state("notion_regions:job-ok", '["München"]')
+    respx.patch(f"{API_BASE}/pages/page-bad").mock(
+        return_value=httpx.Response(400, json={"message": "bad"})
+    )
+    respx.patch(f"{API_BASE}/pages/page-ok").mock(
+        return_value=httpx.Response(200, json={"id": "page-ok"})
+    )
+
+    updated = sync.update_job_regions([("job-bad", "Berlin"), ("job-ok", "Berlin")])
+    assert updated == 1  # job-bad logged and skipped, never raised
 
 
 # -- error handling / retries --------------------------------------------------

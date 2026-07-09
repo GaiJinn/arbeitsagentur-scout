@@ -192,8 +192,18 @@ def _collect_new_jobs(
     sources: dict[str, JobSource],
     storage: JobStorage,
     analyzer: LLMAnalyzer | None,
-) -> list[tuple[Job, JobScore | None]]:
+) -> tuple[list[tuple[Job, JobScore | None]], list[tuple[str, str]]]:
+    """Returns (new_jobs, region_sightings).
+
+    region_sightings are (refnr, region) pairs for already-known jobs re-seen
+    by a query with a region: multi-location postings (one refnr, several
+    Arbeitsorte) are first saved by whichever query runs first, so without
+    this a Berlin-only view in Notion stays empty whenever every Berlin hit
+    was already claimed by Düsseldorf/München. notion_sync appends these to
+    the page's City multi-select."""
     new_jobs: list[tuple[Job, JobScore | None]] = []
+    region_sightings: list[tuple[str, str]] = []
+    sighted: set[tuple[str, str]] = set()
     llm_calls = 0
 
     for query in SEARCH_QUERIES:
@@ -223,6 +233,9 @@ def _collect_new_jobs(
         log.info("  → %s results from API (raw)", len(results))
         for job in results:
             if storage.has_job(job.refnr):
+                if region and (job.refnr, region) not in sighted:
+                    sighted.add((job.refnr, region))
+                    region_sightings.append((job.refnr, region))
                 continue
             # Stamped on the in-memory Job so a later notion_sync.sync_job
             # call (same run, same new_jobs list) knows which JobSource this
@@ -270,7 +283,7 @@ def _collect_new_jobs(
             storage.save(job, score)
             new_jobs.append((job, score))
 
-    return new_jobs
+    return new_jobs, region_sightings
 
 
 def _now_iso() -> str:
@@ -373,7 +386,7 @@ def main() -> int:
                 for name, cls in SOURCE_REGISTRY.items()
                 if name in active_source_names
             }
-            new_jobs = _collect_new_jobs(sources, storage, analyzer)
+            new_jobs, region_sightings = _collect_new_jobs(sources, storage, analyzer)
 
         log.info("New jobs total: %d", len(new_jobs))
         if not new_jobs:
@@ -387,6 +400,16 @@ def main() -> int:
         if notion and new_jobs:
             synced = notion.sync_new_jobs(new_jobs)
             log.info("Notion sync: %d/%d new jobs synced.", synced, len(new_jobs))
+
+        # After the sync, so a job that was new this run (page just created)
+        # and re-seen by a later query's city still finds its page.
+        if notion and region_sightings:
+            updated = notion.update_job_regions(region_sightings)
+            if updated:
+                log.info(
+                    "Notion City updates: %d page(s) gained a city (from %d re-sightings).",
+                    updated, len(region_sightings),
+                )
 
         # Filter for Telegram: push-eligible (Düsseldorf) AND actually scored at
         # or above threshold. Unscored jobs (no Stellenbeschreibung → no LLM

@@ -273,6 +273,12 @@ duplicate it via the API:
 - **Table view, grouped by Score** — click the "..." menu → Group → Score to
   see counts per score band.
 - **Sort by Seen At descending** — a simple "what's new" feed.
+- **Board/table view, grouped by City** — the per-metro trend view. City is
+  a multi-select fed by each query's `"region"`: multi-location postings
+  (one refnr offered in several cities — consultancies, agencies, remote
+  roles) are created by whichever query sees them first and gain the other
+  cities as later queries re-see the same refnr, so e.g. a Berlin group
+  fills in even when every Berlin hit is also posted in Düsseldorf/München.
 
 A Notion outage or misconfiguration never affects the actual job search /
 scoring / Telegram alert — sync failures are logged and swallowed, not
