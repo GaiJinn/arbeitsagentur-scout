@@ -5,6 +5,7 @@ over mocked HTTP.
 """
 from __future__ import annotations
 
+import logging
 import os
 from types import SimpleNamespace
 
@@ -311,6 +312,52 @@ def test_heartbeat_disabled_when_hours_zero(monkeypatch):
     notifier = RecordingNotifier()
     scout._handle_heartbeat(notifier, storage, alert_sent=False, quiet=True, total_new=1)
     assert notifier.texts == []
+
+
+def test_heartbeat_noop_without_notifier(monkeypatch):
+    # By design: the heartbeat is a Telegram feature, so without a notifier
+    # there is nothing to ping through — liveness monitoring for
+    # Telegram-less setups is HEALTHCHECK_URL's job, not the heartbeat's.
+    monkeypatch.setattr(scout, "HEARTBEAT_HOURS", 24)
+    storage = FakeBotStorage()
+    scout._handle_heartbeat(None, storage, alert_sent=False, quiet=True, total_new=0)
+    assert storage.state == {}  # nothing sent, heartbeat window untouched
+
+
+def test_no_description_skip_logged_at_info(monkeypatch, caplog):
+    """Missing Stellenbeschreibung is an expected, common condition (agency
+    reposts) — it must log at INFO, not WARNING, so quiet environments aren't
+    flooded with per-job false alarms."""
+    _patch_queries(monkeypatch, [{"label": "q1", "params": {}}])
+    storage = FakeStorage()
+    client = FakeClient([make_job("job-1")], details={})
+    with caplog.at_level(logging.INFO, logger="scout"):
+        scout._collect_new_jobs(_sources(client), storage, FakeAnalyzer())
+    hits = [r for r in caplog.records if "No Stellenbeschreibung" in r.getMessage()]
+    assert hits, "expected the scoring skip to be logged"
+    assert {r.levelname for r in hits} == {"INFO"}
+
+
+def test_channel_status_unconfigured_telegram_logs_info(monkeypatch, caplog):
+    # Both credentials absent = intentional feature-off (tests, autodev,
+    # console-only setups) — must not warn on every run.
+    monkeypatch.setattr(scout, "TELEGRAM_TOKEN", "")
+    monkeypatch.setattr(scout, "TELEGRAM_CHAT_ID", "")
+    with caplog.at_level(logging.INFO, logger="scout"):
+        scout._log_channel_status(analyzer=FakeAnalyzer(), notifier=None, notion=None)
+    hits = [r for r in caplog.records if "Telegram" in r.getMessage()]
+    assert [r.levelname for r in hits] == ["INFO"]
+
+
+def test_channel_status_half_configured_telegram_warns(monkeypatch, caplog):
+    # Exactly one of the pair set is almost certainly a config mistake and
+    # must stay loud.
+    monkeypatch.setattr(scout, "TELEGRAM_TOKEN", "123:abc")
+    monkeypatch.setattr(scout, "TELEGRAM_CHAT_ID", "")
+    with caplog.at_level(logging.INFO, logger="scout"):
+        scout._log_channel_status(analyzer=FakeAnalyzer(), notifier=None, notion=None)
+    hits = [r for r in caplog.records if "Telegram" in r.getMessage()]
+    assert [r.levelname for r in hits] == ["WARNING"]
 
 
 def test_llm_call_cap_defers_excess_jobs(monkeypatch):

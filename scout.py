@@ -275,7 +275,10 @@ def _collect_new_jobs(
                         log.exception("LLM scoring failed for %s", job.refnr)
                         score = None
                 else:
-                    log.warning(
+                    # Expected for agency reposts / external-only listings —
+                    # an INFO note, not a warning: the job is still saved and
+                    # mirrored to Notion, just never scored or alerted.
+                    log.info(
                         "No Stellenbeschreibung available for %s (%s) — "
                         "skipping LLM scoring rather than scoring on title alone.",
                         job.refnr, job.title,
@@ -317,6 +320,10 @@ def _handle_heartbeat(
     HEARTBEAT_HOURS — so a silent scout is distinguishable from "just no new
     jobs". `quiet` is False when there *were* high-value jobs but the send
     failed: we deliberately don't paper that over with an all-good ping.
+
+    No notifier → no heartbeat, by design: the heartbeat is a Telegram
+    feature, and liveness monitoring for Telegram-less setups is
+    HEALTHCHECK_URL's job (see _ping_healthcheck), not this function's.
     """
     if alert_sent:
         storage.set_bot_state(HEARTBEAT_STATE_KEY, _now_iso())
@@ -344,6 +351,35 @@ def _handle_heartbeat(
         log.info("Heartbeat ping sent (no jobs above threshold).")
 
 
+def _log_channel_status(
+    analyzer: LLMAnalyzer | None,
+    notifier: TelegramNotifier | None,
+    notion: NotionSync | None,
+) -> None:
+    """One line per disabled channel, at a level matching intent.
+
+    Telegram config that is entirely absent means the feature is off on
+    purpose — tests, CI and the autodev harness run that way permanently, and
+    a WARNING on every such run is alarm noise that buries real problems. So
+    both-unset logs INFO; exactly one of the pair set is almost certainly a
+    config mistake and stays a WARNING (same reasoning as Notion below).
+    """
+    if analyzer is None:
+        log.warning("GROQ_API_KEY not set — running without LLM analysis.")
+    if notifier is None:
+        if TELEGRAM_TOKEN or TELEGRAM_CHAT_ID:
+            log.warning(
+                "Only one of TELEGRAM_TOKEN/TELEGRAM_CHAT_ID is set — "
+                "Telegram disabled, output to console only."
+            )
+        else:
+            log.info("Telegram not configured — output to console only.")
+    if notion is None and (NOTION_API_KEY or NOTION_PARENT_PAGE_ID):
+        # Only one of the two set is almost certainly a config mistake, not
+        # an intentional "feature off" — worth a louder warning than silence.
+        log.warning("NOTION_API_KEY and NOTION_PARENT_PAGE_ID must both be set — Notion sync disabled.")
+
+
 def main() -> int:
     log.info("=== arbeitsagentur-scout run start ===")
     storage = JobStorage(DB_PATH)
@@ -359,14 +395,7 @@ def main() -> int:
         else None
     )
 
-    if analyzer is None:
-        log.warning("GROQ_API_KEY not set — running without LLM analysis.")
-    if notifier is None:
-        log.warning("Telegram credentials missing — output to console only.")
-    if notion is None and (NOTION_API_KEY or NOTION_PARENT_PAGE_ID):
-        # Only one of the two set is almost certainly a config mistake, not
-        # an intentional "feature off" — worth a louder warning than silence.
-        log.warning("NOTION_API_KEY and NOTION_PARENT_PAGE_ID must both be set — Notion sync disabled.")
+    _log_channel_status(analyzer, notifier, notion)
 
     # Only spin up the sources actually referenced by queries.json (usually
     # just "arbeitsagentur"), so adding a second portal later doesn't require
